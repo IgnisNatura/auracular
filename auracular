@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+"""
+Auracular - AUR Heuristic Threat Model.
+
+Not a verdict - a heuristic ranking to tell you which AUR packages deserve a
+manual look before (or after) install. High score = fewer red flags, not
+"proven safe". Anything flagged should still be read by a human.
+
+Checks each package's AUR metadata, its PKGBUILD text, and its git commit
+history (for a dormant-package-quietly-taken-over pattern) - not proof of
+safety or malice, just signals worth attention.
+
+Usage:
+    auracular                        # no args = score every installed AUR package
+    auracular pkgname [pkgname2 ...] # check specific package(s) instead, e.g. before installing
+    auracular -v                     # also show matched PKGBUILD lines
+    auracular --no-history           # skip the git-clone handoff check (faster)
+    auracular --explain pkgname      # plain-English, annotated PKGBUILD walkthrough
+"""
+import argparse
+import json
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import urllib.parse
+import difflib
+from datetime import datetime, timezone
+
+# Generated once via: figlet -f shadow AURACULAR
+BANNER_LINES = [
+    r"    \    |   |  _ \     \     ___| |   | |        \     _ \  ",
+    r"   _ \   |   | |   |   _ \   |     |   | |       _ \   |   | ",
+    r"  ___ \  |   | __ <   ___ \  |     |   | |      ___ \  __ <  ",
+    r"_/    _\\___/ _| \_\_/    _\\____|\___/ _____|_/    _\_| \_\ ",
+]
+
+def use_color():
+    return sys.stdout.isatty()
+
+# Every C0 control except tab/newline, DEL, and the full C1 control block
+# (\x80-\x9f) - the earlier version of this stopped at \x1f/\x7f and missed
+# \x0d (carriage return, usable for an overwrite-line display trick) and the
+# 8-bit C1 controls (e.g. U+009B, a single-codepoint form of CSI/ESC-[).
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+def sanitize(text):
+    """Strip control characters (including ESC and its 8-bit C1 form, which
+    defangs any ANSI escape sequence) from text that ultimately comes from
+    an untrusted package - its AUR description, PKGBUILD content, or git
+    author name. Without this, a malicious package could use terminal
+    escape sequences to hide/rewrite what this tool prints about it, or
+    \\r to overwrite a line's visible content. Newlines and tabs are left
+    alone; this only removes characters with no legitimate display use in a
+    one-line note or table cell."""
+    if text is None:
+        return text
+    return CONTROL_CHARS_RE.sub("", str(text))
+
+def print_banner():
+    width = len(BANNER_LINES[0])
+    lines = BANNER_LINES
+    tagline = "◉  AUR Heuristic Threat Model  ◉".center(width)
+    rule = "-" * width
+
+    color = use_color()
+    green, dim, reset = ("\033[92m", "\033[2m", "\033[0m") if color else ("", "", "")
+
+    print(green + rule + reset)
+    for l in lines:
+        print(green + l + reset)
+    print()
+    print(dim + green + tagline + reset)
+    print(green + rule + reset)
+    print()
+
+AUR_RPC = "https://aur.archlinux.org/rpc/v5/info"
+PKGBUILD_URL = "https://aur.archlinux.org/cgit/aur.git/plain/PKGBUILD?h={pkg}"
+AUR_GIT_URL = "https://aur.archlinux.org/{pkg}.git"
+UA = {"User-Agent": "auracular/0.1 (local heuristic scanner)"}
+DORMANCY_THRESHOLD_DAYS = 180
+
+SUSPICIOUS_PATTERNS = [
+    (r"\b(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(env\s+)?\S*\b(sh|bash|zsh|dash|ksh|fish|python[23]?|perl|ruby|node|php)\b",
+     "pipes a download straight into an interpreter", 30),
+    # Deliberately scoped to eval, not bare $(curl ...)/`curl ...` - capturing
+    # a download's output into a variable (pkgver=$(curl ...) to read a
+    # remote version string, etc.) is an extremely common, benign PKGBUILD
+    # idiom. eval-ing that output is the actually dangerous, no-legitimate-
+    # use shape.
+    (r"\beval\b[^\n]*\$\(\s*(sudo\s+)?(curl|wget)\b", "runs eval on captured download output (executes it as code)", 30),
+    (r"\beval\b[^\n]*`\s*(sudo\s+)?(curl|wget)\b", "runs eval on captured download output via backticks (executes it as code)", 30),
+    (r"\b(curl|wget)\b[^\n|]*\s(-o|-O|--output|--output-document)\b[^\n|]*(/tmp/|\$\{?TMPDIR)",
+     "downloads a file into a temp path outside the build directory", 25),
+    (r"\bchmod\s+([0-7]*[1357]\b)[^\n]*(/tmp/|\$HOME|~/|\$\{?TMPDIR)",
+     "makes a file outside the build tree executable", 25),
+    (r"\bchmod\s+[0-7]?[2-7][0-7]{3}\b", "sets a setuid/setgid bit (numeric mode)", 25),
+    (r"\binstall\b[^\n]*-[a-zA-Z]*m\s*0?[2-7][0-7]{3}\b", "installs a file with a setuid/setgid bit", 25),
+    (r"\bchmod\s+[^\n]*\+s\b", "sets a setuid/setgid bit", 25),
+    (r"\bbase64\s+(-d|-D|--decode)\b|\bopenssl\s+(enc|base64)\b[^\n]*\s-d\b|\bxxd\s+-r\b|\buudecode\b",
+     "decodes an encoded blob (possible obfuscated payload)", 20),
+    (r"\btr\s+['\"\[]?[A-Za-z]-[A-Za-z][^\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b",
+     "de-obfuscates text and pipes it into a shell", 25),
+    (r"\b(z|bz|xz|zst)?cat\b[^\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b", "decompresses straight into a shell", 25),
+    (r"\beval\b", "uses eval (hides what actually runs)", 20),
+    (r"\b(bash|sh|zsh)\s+-c\s+[\"']?\$", "runs a dynamically built shell command", 25),
+    (r"\b(curl|wget)\b[^\n|]*\s(-d|--data|--data-binary|-F|--form|-T|--upload-file)\s",
+     "uploads data to a remote server", 30),
+    (r"/dev/tcp/|\bnc(at)?\s[^\n]*\s-[a-zA-Z]*e\b", "opens a reverse shell", 40),
+    (r"\.ssh/(id_[a-z0-9]+|authorized_keys)|\.gnupg|\.aws/credentials|/etc/shadow|\.config/(gh|hub)/|\.netrc",
+     "reads sensitive credential files", 35),
+    (r"/etc/sudoers|visudo", "touches sudoers", 35),
+    (r"authorized_keys", "touches SSH authorized_keys", 30),
+    (r"https?://\d{1,3}(\.\d{1,3}){3}", "downloads from a raw IP address instead of a domain", 15),
+    (r"://[^/\s]*\b(pastebin\.com|paste\.ee|ptpb\.pw|0x0\.st|transfer\.sh|file\.io|oshi\.at|temp\.sh|"
+     r"termbin\.com|ix\.io|dpaste\.[a-z]+|gist\.githubusercontent\.com|ngrok\.io|ngrok-free\.app|"
+     r"trycloudflare\.com|webhook\.site|requestbin\.[a-z]+|discord(app)?\.com/api/webhooks|api\.telegram\.org)\b",
+     "downloads from or posts to a paste/tunnel/webhook host", 25),
+]
+
+AUX_GLOBS = ("*.install", "*.hook", "*.service", "*.timer")
+
+def http_get(url, timeout=8):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+def fetch_aur_info(names):
+    """Returns {name: info}, or None if the RPC lookup itself failed (network,
+    timeout, bad response, or the RPC's own error shape) - callers must not
+    treat None the same as {} (a lookup that succeeded and found nothing).
+    aurweb can return HTTP 200 with valid JSON that is still an error
+    (`{"type": "error", ...}`, or in principle `null`) - treating that as
+    "queried successfully, found nothing" would silently report every
+    requested package as HIGH RISK "not found on AUR" during an outage."""
+    if not names:
+        return {}
+    qs = "&".join("arg[]=" + urllib.parse.quote(n) for n in names)
+    url = f"{AUR_RPC}?{qs}"
+    try:
+        data = json.loads(http_get(url))
+    except Exception as e:
+        print(f"  ! AUR RPC lookup failed: {e}", file=sys.stderr)
+        return None
+    if not isinstance(data, dict) or data.get("type") != "multiinfo":
+        err = data.get("error") if isinstance(data, dict) else "unexpected response shape"
+        print(f"  ! AUR RPC returned an unexpected/error response: {err}", file=sys.stderr)
+        return None
+    results = data.get("results")
+    if not isinstance(results, list):
+        print("  ! AUR RPC response had a malformed 'results' field", file=sys.stderr)
+        return None
+    return {r["Name"]: r for r in results if isinstance(r, dict) and "Name" in r}
+
+def fetch_pkgbuild(name):
+    try:
+        return http_get(PKGBUILD_URL.format(pkg=urllib.parse.quote(name)))
+    except Exception as e:
+        print(f"  ! couldn't fetch PKGBUILD for {name}: {e}", file=sys.stderr)
+        return None
+
+def looks_like_pkgbuild(text):
+    """A 200 OK response carrying an HTML error/challenge page (rate-limit,
+    WAF, anti-bot interstitial, ...) is not an exception - http_get returns
+    it as ordinary text, and scanning it finds no suspicious patterns
+    because it isn't shell code at all. Without this check that reads as
+    "scanned, clean" instead of "not actually read"."""
+    if not text:
+        return False
+    head = text[:2000]
+    if re.search(r"<!doctype html|<html[\s>]", head, re.IGNORECASE):
+        return False
+    return bool(re.search(r"^\s*pkgname\s*=", text, re.MULTILINE))
+
+def installed_foreign_packages():
+    try:
+        out = subprocess.run(["pacman", "-Qmq"], capture_output=True, text=True, check=True).stdout
+    except Exception as e:
+        print(f"Couldn't run pacman -Qmq: {e}", file=sys.stderr)
+        return []
+    return [l.strip() for l in out.splitlines() if l.strip()]
+
+def official_repo_names():
+    try:
+        out = subprocess.run(["pacman", "-Slq"], capture_output=True, text=True, check=True).stdout
+        return set(l.strip() for l in out.splitlines() if l.strip())
+    except Exception:
+        return set()
+
+CONTINUATION_OPERATORS = ("|", "&&", "||")
+
+def logical_lines(text):
+    """(first_physical_line_no, joined_line) pairs. Two shapes of line
+    continuation are joined so a single logical command isn't dodged by
+    splitting it across physical lines: an explicit trailing backslash, and
+    an unescaped trailing pipe/and/or operator (bash itself keeps reading
+    in both cases).
+
+    A COMMENT line's trailing backslash is deliberately NOT treated as a
+    continuation: in real bash, a comment always ends at the physical
+    newline regardless of what it ends with, so a backslash-terminated
+    comment must not be allowed to swallow the real code on the next line.
+
+    A backslash continuation is spliced exactly like bash does it - the
+    backslash and newline are simply removed, with no space inserted - so a
+    word deliberately split mid-token ("cu\\" + "rl ...") still reassembles
+    into the real token instead of being hidden behind an accidental space.
+
+    A pending pipe/and/or continuation also survives an intervening comment
+    or blank line, matching real bash: the parser is still waiting for the
+    next token of the same pipeline, and a comment or blank line contributes
+    nothing to that wait - it doesn't end it."""
+    out, buf, start = [], "", None
+    pending = False
+    for i, raw in enumerate(text.splitlines(), 1):
+        stripped = raw.rstrip()
+        is_comment = stripped.lstrip().startswith("#")
+        is_blank = not stripped.strip()
+        if pending and (is_comment or is_blank):
+            continue
+        if start is None:
+            start = i
+        if not is_comment and stripped.endswith("\\"):
+            buf += stripped[:-1]
+            pending = True
+            continue
+        if not is_comment and stripped.endswith(CONTINUATION_OPERATORS):
+            buf += raw + " "
+            pending = True
+            continue
+        buf += raw
+        out.append((start, re.sub(r"[ \t]+", " ", buf)))
+        buf, start = "", None
+        pending = False
+    if buf:
+        out.append((start, re.sub(r"[ \t]+", " ", buf)))
+    return out
+
+def scan_pkgbuild(text, source_label="PKGBUILD"):
+    """Charges each matching pattern once (with a count of how many lines it
+    hit), not once per line - a package repeating the same flagged line
+    several times shouldn't stack an unbounded, hard-to-read penalty."""
+    flags = []
+    if not text:
+        return flags
+    # Comment-only lines don't execute - scanning them just produces false
+    # positives from example commands ("# or use: curl ... | sh") in
+    # otherwise-clean PKGBUILDs.
+    lines = [(n, l) for n, l in logical_lines(text) if not l.strip().startswith("#")]
+    for pattern, desc, penalty in SUSPICIOUS_PATTERNS:
+        hits = [(n, l) for n, l in lines if re.search(pattern, l, re.IGNORECASE)]
+        if hits:
+            line_no, line = hits[0]
+            flags.append({
+                "desc": desc, "penalty": penalty, "line_no": line_no,
+                "line": sanitize(line.strip()), "count": len(hits),
+                "source": sanitize(source_label),
+            })
+    return flags
+
+def fetch_commit_history(name, timeout=15):
+    """Clone the package's AUR git repo and return (commits, aux_files).
+    commits is a list of (email, author_name, unix_ts) per commit, oldest
+    first, or None on any failure - callers should treat None as "history
+    unavailable", not "clean". aux_files is {filename: contents} for any
+    .install/.hook/.service/.timer files in the repo (these can run as root
+    at install time and are worth scanning too), and is always a dict (may
+    be empty), even when commits is None.
+
+    AUR packages are tiny repos (PKGBUILD + maybe an .install file), so a
+    full clone is cheap."""
+    tmpdir = tempfile.mkdtemp(prefix="aurtc-")
+    try:
+        url = AUR_GIT_URL.format(pkg=urllib.parse.quote(name))
+        r = subprocess.run(["git", "clone", "--quiet", url, tmpdir],
+                            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None, {}
+        r2 = subprocess.run(["git", "-C", tmpdir, "log", "--reverse", "--format=%ae|%an|%at"],
+                             capture_output=True, text=True, timeout=timeout)
+        if r2.returncode != 0:
+            return None, {}
+        commits = []
+        for line in r2.stdout.splitlines():
+            parts = line.split("|", 2)
+            if len(parts) != 3:
+                continue
+            email, author_name, ts = parts
+            try:
+                commits.append((email.strip().lower(), author_name.strip(), int(ts)))
+            except ValueError:
+                continue
+        aux_files = {}
+        tmp_root = pathlib.Path(tmpdir).resolve()
+        for pattern in AUX_GLOBS:
+            for p in pathlib.Path(tmpdir).rglob(pattern):
+                # A malicious package's repo could commit a symlink (e.g.
+                # "pwn.install" -> "/home/you/.ssh/id_rsa") to trick this
+                # scanner into reading and possibly displaying an arbitrary
+                # local file. Refuse anything that isn't a plain regular
+                # file fully contained in the clone.
+                if p.is_symlink():
+                    continue
+                try:
+                    resolved = p.resolve()
+                    resolved.relative_to(tmp_root)
+                    if not resolved.is_file() or resolved.stat().st_size > 1_000_000:
+                        continue
+                    aux_files[str(p.relative_to(tmpdir))] = resolved.read_text(errors="replace")
+                except (OSError, ValueError):
+                    continue
+        return commits, aux_files
+    except Exception:
+        return None, {}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+# Domains shared by unrelated strangers (free mail providers, GitHub's
+# per-user noreply domain, ...) - matching on these alone says nothing about
+# whether two commits came from the same person. A private/company domain
+# match is real evidence; a match on one of these needs corroboration too.
+GENERIC_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "yahoo.com", "proton.me", "protonmail.com", "pm.me", "icloud.com", "me.com",
+    "fastmail.com", "users.noreply.github.com", "posteo.de", "tutanota.com",
+    "mailbox.org", "web.de", "gmx.de", "gmx.net", "t-online.de", "qq.com", "163.com",
+}
+
+def identity_similar(a, b):
+    """a, b are (email, name). True if they plausibly belong to the same
+    person despite a cosmetic git-config change (same email, a matching
+    non-generic domain, a matching local-part on a generic domain, or a
+    close name match) - same person switching machines is common and
+    shouldn't read as a handoff. A shared *generic* domain (gmail.com,
+    users.noreply.github.com, ...) is NOT enough on its own: unrelated
+    people share those constantly, and treating it as a match would mask a
+    real handoff between two different Gmail users."""
+    email_a, name_a = a
+    email_b, name_b = b
+    if email_a == email_b:
+        return True
+    local_a, _, domain_a = email_a.partition("@")
+    local_b, _, domain_b = email_b.partition("@")
+    if domain_a and domain_a == domain_b:
+        if domain_a not in GENERIC_EMAIL_DOMAINS:
+            return True
+        if difflib.SequenceMatcher(None, local_a, local_b).ratio() > 0.8:
+            return True
+    return difflib.SequenceMatcher(None, name_a.lower(), name_b.lower()).ratio() > 0.75
+
+def analyze_maintainer_history(commits):
+    """Group commits into maintainer 'eras' (runs of similar identities) and
+    check whether ANY era boundary shows a long dormancy gap - the shape of
+    a dormant package getting quietly taken over, not routine
+    co-maintenance. Looking only at the last two eras (eras[-2] vs eras[-1])
+    would let a single follow-up commit under a third identity push the
+    actual takeover out of view, erasing the detection - so every boundary
+    is checked and the most recent qualifying one wins. Returns a dict
+    describing the handoff, or None if there isn't one / there's not enough
+    history to tell / a qualifying handoff is old and long-settled."""
+    if not commits or len(commits) < 2:
+        return None
+
+    eras = []
+    for email, author_name, ts in commits:
+        identity = (email, author_name)
+        if eras and any(identity_similar(identity, i) for i in eras[-1]["identities"]):
+            eras[-1]["identities"].add(identity)
+            eras[-1]["end_ts"] = ts
+            eras[-1]["count"] += 1
+        else:
+            eras.append({
+                "identities": {identity}, "start_ts": ts, "end_ts": ts,
+                "count": 1, "first_identity": identity,
+            })
+
+    if len(eras) < 2:
+        return None
+
+    boundaries = [
+        (i, (eras[i + 1]["start_ts"] - eras[i]["end_ts"]) / 86400)
+        for i in range(len(eras) - 1)
+    ]
+    qualifying = [(i, gap) for i, gap in boundaries if gap >= DORMANCY_THRESHOLD_DAYS]
+    if not qualifying:
+        return None
+
+    idx, gap_days = qualifying[-1]
+    latest_era = eras[idx + 1]
+    commits_since = sum(e["count"] for e in eras[idx + 1:])
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    since_takeover_days = (now_ts - latest_era["start_ts"]) / 86400
+
+    # A handoff that happened years ago, with the new maintainer having put
+    # in real work since, isn't a live signal - it's history. Reporting it
+    # forever just crowds out packages with an actual recent, thin handoff.
+    if since_takeover_days > 730 and commits_since > 5:
+        return None
+
+    new_identity_name = sanitize(latest_era["first_identity"][1])
+
+    return {
+        "gap_days": int(gap_days),
+        "commits_since": commits_since,
+        "since_takeover_days": int(since_takeover_days),
+        "new_identity_name": new_identity_name,
+    }
+
+def typosquat_check(name, official_names):
+    if name in official_names or not official_names:
+        return None
+    close = difflib.get_close_matches(name, official_names, n=1, cutoff=0.85)
+    if close and close[0] != name:
+        return close[0]
+    return None
+
+def score_package(name, info, pkgbuild_flags, typosquat_target, handoff=None,
+                   history_unavailable=False, aux_flags=None, verbose=False):
+    """pkgbuild_flags is None when the PKGBUILD could not be fetched/scanned
+    at all (distinct from an empty list, which means it WAS scanned and
+    nothing matched) - callers must pass None rather than [] in that case,
+    or an unscanned package silently reads as "clean". aux_flags (findings
+    from .install/.hook/etc files) is kept as a SEPARATE parameter rather
+    than merged into pkgbuild_flags before calling this: merging them would
+    turn a None (PKGBUILD unscanned) into a non-None list the moment any
+    aux finding exists, silently erasing the "PKGBUILD was never read"
+    warning even though the PKGBUILD itself - the primary thing this tool
+    is supposed to check - still wasn't."""
+    score = 70  # neutral baseline
+    notes = []
+
+    if info is None:
+        return 0, ["not found on AUR (may have been removed, or you mistyped the name)"]
+
+    votes = info.get("NumVotes", 0)
+    pop = info.get("Popularity", 0.0)
+    maintainer = info.get("Maintainer")
+    first = info.get("FirstSubmitted")
+    age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(first, tz=timezone.utc)).days if first else None
+    age_str = f"{age_days}d old" if age_days is not None else "age unknown"
+    notes.append(f"baseline: {votes} votes, popularity {pop:.2f}, {age_str}, maintainer={sanitize(maintainer) or 'none'}")
+
+    if maintainer is None:
+        score -= 30
+        notes.append("orphaned: no maintainer")
+
+    unscanned = pkgbuild_flags is None
+    all_flags = (pkgbuild_flags or []) + (aux_flags or [])
+
+    if votes < 5 and pop < 0.5:
+        score -= 15
+        notes.append(f"very low adoption ({votes} votes, popularity {pop:.2f})")
+    elif votes >= 50 and not all_flags:
+        # Popularity/age is not a mitigation for an actual code-execution
+        # finding - a compromised popular package is the primary threat
+        # this tool exists to catch, so don't let adoption offset it.
+        score += 10
+        notes.append(f"well-adopted ({votes} votes)")
+
+    if info.get("OutOfDate"):
+        ood = datetime.fromtimestamp(info["OutOfDate"], tz=timezone.utc)
+        days = (datetime.now(timezone.utc) - ood).days
+        penalty = min(20, 5 + days // 30)
+        score -= penalty
+        notes.append(f"flagged out-of-date {days}d ago and still unresolved")
+
+    if age_days is not None and age_days < 30:
+        score -= 10
+        notes.append(f"brand new package ({age_days}d old)")
+
+    if unscanned:
+        score -= 20
+        notes.append("PKGBUILD could NOT be fetched - it was NOT scanned; this score is "
+                      "metadata-only and must not be read as 'clean'")
+    for f in all_flags:
+        score -= f["penalty"]
+        line_suffix = f" -> {f['line']}" if verbose else ""
+        count_suffix = f" [x{f['count']}]" if f.get("count", 1) > 1 else ""
+        source = f.get("source", "PKGBUILD")
+        notes.append(f"{source}: {f['desc']} (line {f['line_no']}){count_suffix}{line_suffix}")
+
+    if typosquat_target:
+        established = age_days is not None and age_days >= 1000 and votes >= 5
+        if established:
+            score -= 10
+            notes.append(
+                f"name resembles official package '{typosquat_target}', but this package is "
+                f"well-established ({age_days}d old, {votes} votes) - likely a coincidence, not a typosquat"
+            )
+        else:
+            score -= 25
+            notes.append(f"name closely resembles official package '{typosquat_target}' - possible typosquat, treat with real caution")
+
+    if handoff:
+        penalty = 15
+        if handoff["commits_since"] <= 3:
+            penalty += 10
+        if handoff["since_takeover_days"] <= 90:
+            penalty += 10
+        score -= min(penalty, 35)
+        notes.append(
+            f"possible maintainer handoff: '{handoff['new_identity_name']}' took over after "
+            f"{handoff['gap_days']}d of dormancy - {handoff['commits_since']} commit(s) since, "
+            f"{handoff['since_takeover_days']}d ago"
+        )
+    elif history_unavailable:
+        notes.append("commit history unavailable - the maintainer-handoff check did not run")
+
+    score = max(0, min(100, score))
+
+    # A severe PKGBUILD finding is a ceiling, not just an addend - no
+    # combination of votes/age/popularity should be able to buy a package's
+    # way out of the bucket a remote-code-execution flag puts it in.
+    if unscanned:
+        score = min(score, 60)
+    if all_flags:
+        worst = max(f["penalty"] for f in all_flags)
+        if worst >= 30:
+            score = min(score, 24)
+        elif worst >= 20:
+            score = min(score, 49)
+
+    return score, notes
+
+# --- PKGBUILD explainer ------------------------------------------------
+# Static, best-effort line annotations for the prepare()/build()/check()/
+# package() functions. This never executes the PKGBUILD - only regex-reads
+# it - because the whole point is understanding it BEFORE trusting it
+# enough to run through makepkg.
+
+LINE_ANNOTATIONS = [
+    (r'^cd\s+"?\$srcdir', "moves into the extracted source directory"),
+    (r'^cd\s+"?\$pkgdir', "moves into the packaging directory (unusual here; normally only used inside package())"),
+    (r'\./configure\b', "runs an autotools 'configure' script to set up the build"),
+    (r'^\s*make\b.*\binstall\b', "installs the compiled output into the packaging directory"),
+    (r'^\s*make\b', "compiles the project with make"),
+    (r'\bcmake\b.*-B\s', "configures the build using CMake"),
+    (r'\bninja\b', "builds using Ninja (usually paired with CMake or Meson)"),
+    (r'\bmeson\s+setup\b', "configures the build using Meson"),
+    (r'\bcargo\s+build\b', "compiles a Rust project with Cargo"),
+    (r'\bgo\s+build\b', "compiles a Go project"),
+    (r'\bpip\s+install\b.*--root', "installs a Python package into the packaging directory"),
+    (r'\bnpm\s+(ci|install)\b', "installs Node.js dependencies"),
+    (r'\binstall\s+-D\S*m\s*0?7\d\d', "installs a file as an executable into the package"),
+    (r'\binstall\s+-D\S*m\s*0?6\d\d', "installs a file as regular data/config into the package"),
+    (r'\bstrip\b', "strips debug symbols from a compiled binary"),
+    (r'\bsed\s+-i\b', "edits a file in place - worth checking what it actually changes"),
+    (r'\bpatch\s+-p', "applies a patch file to the source before building"),
+    (r'\bln\s+-s\b', "creates a symlink"),
+    (r'\brm\s+-rf\b', "recursively force-deletes files - check the path is scoped to a build dir, not somewhere broader"),
+    (r'\bchmod\s+[0-7]?[2-7][0-7]{3}\b', "!! sets a setuid/setgid bit (numeric mode) - makes a binary run with its owner's (often root's) privileges no matter who runs it"),
+    (r'\bsudo\b', "!! runs a command as root - makepkg never needs this; a legitimate PKGBUILD never does this"),
+    (r'\bcurl\b|\bwget\b', "downloads something at build time - normally everything downloaded should already be listed in source=() instead, so this is worth a second look"),
+    (r'\bchmod\b.*\+s', "!! sets a setuid/setgid bit - makes a binary run with its owner's (often root's) privileges no matter who runs it"),
+    (r'\beval\b', "!! runs a dynamically-built command - hides what actually executes"),
+]
+
+KNOWN_HOSTS = {
+    "github.com", "gitlab.com", "sourceforge.net", "gnu.org", "kernel.org",
+    "pypi.org", "files.pythonhosted.org", "crates.io", "registry.npmjs.org",
+    "npmjs.com", "codeberg.org", "bitbucket.org",
+}
+
+def extract_scalar(text, varname):
+    # ^ (line-start, MULTILINE) rather than a word-boundary lookbehind: a
+    # lookbehind alone would still match "depends=" inside "makedepends=",
+    # AND - the bug this exact line once had - would match a commented-out
+    # "# install=old.install" too, since the character before "install" in
+    # a comment is just a space, which a word-boundary check treats as fine.
+    # PKGBUILD assignments are conventionally at column 0; requiring that
+    # rules out both problems at once.
+    m = re.search(rf'^{re.escape(varname)}=(.+)$', text, re.MULTILINE)
+    if not m:
+        return None
+    return m.group(1).strip().strip('"\'')
+
+def extract_array(text, varname):
+    # See extract_scalar for why this is ^-anchored rather than a lookbehind.
+    m = re.search(rf'^{re.escape(varname)}=\(([^)]*)\)', text, re.MULTILINE | re.DOTALL)
+    if not m:
+        scalar = extract_scalar(text, varname)
+        return [scalar] if scalar else []
+    try:
+        return shlex.split(m.group(1), comments=True)
+    except ValueError:
+        return m.group(1).split()
+
+def extract_function_body(text, funcname):
+    """Brace-depth walk that tracks quotes (and comments), so a literal '}'
+    inside a string - e.g. `printf "}"` - doesn't prematurely end the
+    function and silently truncate the rest of it from --explain's output.
+    ^-anchored (see extract_scalar) so a commented-out "# package() { ... }"
+    placeholder before the real definition can't be matched instead of it."""
+    m = re.search(rf'^{re.escape(funcname)}\s*\(\)\s*\{{', text, re.MULTILINE)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    in_squote = in_dquote = False
+    while i < len(text) and depth > 0:
+        c = text[i]
+        if in_squote:
+            if c == "'":
+                in_squote = False
+        elif in_dquote:
+            if c == '\\':
+                i += 1
+            elif c == '"':
+                in_dquote = False
+        elif c == "'":
+            in_squote = True
+        elif c == '"':
+            in_dquote = True
+        elif c == '#':
+            nl = text.find('\n', i)
+            i = nl if nl != -1 else len(text)
+            continue
+        elif c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+        i += 1
+    return text[m.end():i - 1]
+
+def annotate_line(line):
+    for pattern, note in LINE_ANNOTATIONS:
+        if re.search(pattern, line):
+            return note
+    return None
+
+def source_host(entry):
+    # PKGBUILD source entries may use "renamed-file::url" syntax. Only treat
+    # "::" as that separator if it appears BEFORE the URL's own "://" -
+    # otherwise it's more likely bash substring syntax inside a variable
+    # embedded in the URL itself, e.g. "${_realname::1}".
+    scheme_idx = entry.find("://")
+    prefix = entry[:scheme_idx] if scheme_idx != -1 else entry
+    sep = prefix.rfind("::")
+    url = entry[sep + 2:] if sep != -1 else entry
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc:
+        if "$" in url:
+            return None, "origin can't be statically resolved (built from a variable) - check how that variable is defined"
+        return None, "local file bundled with the package (no download)"
+    label = "known code-hosting site" if parsed.netloc in KNOWN_HOSTS else "unrecognized host - worth a manual glance"
+    return parsed.netloc, label
+
+def print_explain_report(name, info, pkgbuild, base=None):
+    base = base or name
+    if not info:
+        print(f"'{name}' wasn't found on the AUR.")
+        return
+    if not pkgbuild:
+        print(f"Found '{name}' on the AUR, but couldn't fetch its PKGBUILD.")
+        return
+
+    print(f"=== {sanitize(name)} - what this package is ===")
+    print(f"  {sanitize(info.get('Description', '(no description)'))}")
+    print(f"  version: {sanitize(info.get('Version', '?'))}   maintainer: {sanitize(info.get('Maintainer')) or 'none (orphaned)'}")
+    print(f"  upstream: {sanitize(info.get('URL', '?'))}")
+    print(f"  votes: {info.get('NumVotes', 0)}   popularity: {info.get('Popularity', 0.0):.2f}")
+
+    print("\n=== dependencies ===")
+    for label, var in (("runtime (depends)", "depends"), ("build-time only (makedepends)", "makedepends"),
+                        ("optional (optdepends)", "optdepends")):
+        items = [sanitize(i) for i in extract_array(pkgbuild, var)]
+        if items:
+            print(f"  {label}: {', '.join(items)}")
+
+    print("\n=== where the source comes from ===")
+    sources = extract_array(pkgbuild, "source")
+    if not sources:
+        print("  no source=() array found (unusual - read the PKGBUILD directly)")
+    for entry in sources:
+        entry = sanitize(entry)
+        host, label = source_host(entry)
+        if host:
+            print(f"  {entry}\n    -> {host} ({label})")
+        else:
+            print(f"  {entry}\n    -> {label}")
+
+    print("\n=== what the build actually does ===")
+    any_function = False
+    for func in ("prepare", "build", "check", "package"):
+        body = extract_function_body(pkgbuild, func)
+        # Split packages (pkgname=(a b ...)) define package_<name>() per
+        # subpackage instead of one shared package() - fall back to that so
+        # --explain on a split package doesn't wrongly report "no package()".
+        if body is None and func == "package":
+            split_func = f"package_{name}"
+            body = extract_function_body(pkgbuild, split_func)
+            if body is not None:
+                func = split_func
+        if body is None:
+            continue
+        any_function = True
+        print(f"\n  {func}() {{")
+        for raw_line in body.splitlines():
+            line = sanitize(raw_line.strip())
+            if not line or line.startswith("#"):
+                continue
+            note = annotate_line(line)
+            if note:
+                print(f"    {line}")
+                print(f"        ^ {note}")
+            else:
+                print(f"    {line}")
+                print(f"        ^ (not a pattern this script recognizes - worth reading yourself)")
+        print("  }")
+    if not any_function:
+        print("  no prepare()/build()/check()/package() functions found - unusual for a normal PKGBUILD")
+
+    flags = scan_pkgbuild(pkgbuild)
+    print("\n=== automated red-flag scan ===")
+    if flags:
+        for f in flags:
+            count_suffix = f" [x{f['count']}]" if f.get("count", 1) > 1 else ""
+            print(f"  ! {f['desc']}{count_suffix} (line {f['line_no']}): {f['line']}")
+    else:
+        print("  none of this script's known-bad patterns matched")
+
+    install_file = sanitize(extract_scalar(pkgbuild, "install"))
+    if install_file:
+        print(f"\n  !! sets install={install_file} - that file can run code as ROOT at install/"
+              f"upgrade time, which this scan does not read. Fetch and read it yourself:")
+        print(f"     https://aur.archlinux.org/cgit/aur.git/plain/{install_file}?h={base}")
+
+    print(PKGBUILD_PRIMER)
+
+PKGBUILD_PRIMER = """
+=== PKGBUILD anatomy, quick primer ===
+A PKGBUILD is a bash script, not a config file - everything in it is code
+that runs. Reading order that actually matters:
+  1. source=()      what gets downloaded, and from where. This is the
+                     single most important line for trust - a package
+                     pulling from a domain you don't recognize deserves
+                     more scrutiny than one pulling from the project's own
+                     GitHub.
+  2. sha256sums=() / b2sums=()   checksums that pin the exact bytes of each
+                     source= entry. makepkg refuses to build if they don't
+                     match - this is what stops a compromised upstream
+                     server from silently swapping the tarball later.
+  3. prepare()      optional: patches/fixes applied to the source before
+                     building.
+  4. build()        compiles the software. For most packages this is just
+                     the project's normal build commands (make, cmake,
+                     cargo build, ...) - nothing package-specific should
+                     need to happen here beyond that.
+  5. package()      THIS is the one that matters most for "what ends up on
+                     my system" - it copies build output into $pkgdir,
+                     which becomes the actual installed package. Anything
+                     install -Dm... $pkgdir/... here is a real file that
+                     lands on your machine.
+$srcdir = where the source got extracted to (scratch space, thrown away
+after build). $pkgdir = the staging root for what actually gets installed
+- treat any line touching $pkgdir as the one to read most carefully.
+"""
+
+def headline_reason(notes, max_len=58):
+    non_baseline = [n for n in notes if not n.startswith("baseline:")]
+    if not non_baseline:
+        return "no red flags, but no strong positive signals either"
+    text = "; ".join(non_baseline)
+    if len(text) <= max_len:
+        return text
+    cut = text.rfind(" ", 0, max_len - 3)
+    cut = cut if cut > 0 else max_len - 3
+    return text[:cut] + "... (see below)"
+
+def bucket(score):
+    if score >= 75:
+        return "LOW RISK"
+    if score >= 50:
+        return "REVIEW"
+    if score >= 25:
+        return "CAUTION"
+    return "HIGH RISK"
+
+# icon, ANSI color code per bucket. Kept to single-width, non-emoji-presentation
+# glyphs so table columns stay aligned across terminals/fonts.
+RISK_STYLE = {
+    "LOW RISK":  ("✓", "\033[92m"),  # check mark, green
+    "REVIEW":    ("?",      "\033[96m"),  # cyan
+    "CAUTION":   ("⚠", "\033[93m"),  # warning sign, yellow
+    "HIGH RISK": ("☠", "\033[91m"),  # skull, red
+}
+
+def color_wrap(text, color_code):
+    # Pad/measure `text` BEFORE calling this - wrapping happens after padding
+    # so escape codes never throw off column alignment.
+    if not use_color():
+        return text
+    return f"{color_code}{text}\033[0m"
+
+def styled_bucket_field(score, width):
+    label = bucket(score)
+    icon, color_code = RISK_STYLE[label]
+    padded = f"{icon} {label}".ljust(width)
+    return color_wrap(padded, color_code)
+
+def styled_score_field(score, width):
+    color_code = RISK_STYLE[bucket(score)][1]
+    padded = f"{score}".rjust(width)
+    return color_wrap(padded, color_code)
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("packages", nargs="*", help="AUR package names to check")
+    ap.add_argument("--installed", action="store_true", help="check every foreign/AUR package currently installed")
+    ap.add_argument("-v", "--verbose", action="store_true", help="show matched PKGBUILD lines")
+    ap.add_argument("--no-history", action="store_true",
+                     help="skip the git-history maintainer-handoff check (faster, but misses takeover detection)")
+    ap.add_argument("--explain", metavar="PKG",
+                     help="print a plain-English, annotated PKGBUILD walkthrough for one package")
+    args = ap.parse_args()
+
+    print_banner()
+
+    if args.explain:
+        explain_info = fetch_aur_info([args.explain])
+        if explain_info is None:
+            print("Couldn't reach the AUR RPC endpoint - try again in a moment.", file=sys.stderr)
+            sys.exit(1)
+        info = explain_info.get(args.explain)
+        base = info.get("PackageBase") or args.explain if info else args.explain
+        pkgbuild = fetch_pkgbuild(base) if info else None
+        if pkgbuild and not looks_like_pkgbuild(pkgbuild):
+            print(f"  ! fetched content doesn't look like a PKGBUILD (error/challenge page?)", file=sys.stderr)
+            pkgbuild = None
+        print_explain_report(args.explain, info, pkgbuild, base=base)
+        return
+
+    names = list(args.packages)
+    if args.installed or not names:
+        if not names:
+            print("No packages given - defaulting to every installed AUR package (--installed).", file=sys.stderr)
+        names += installed_foreign_packages()
+    names = sorted(set(names))
+
+    if not names:
+        print("No foreign (AUR) packages are currently installed.", file=sys.stderr)
+        sys.exit(0)
+
+    print(f"Looking up {len(names)} package(s) on AUR...", file=sys.stderr)
+    aur_info = fetch_aur_info(names)
+    if aur_info is None:
+        print("Couldn't reach the AUR RPC endpoint - no scores can be produced right now. "
+              "Try again in a moment.", file=sys.stderr)
+        sys.exit(1)
+    official_names = official_repo_names()
+
+    results = []
+    for name in names:
+        info = aur_info.get(name)
+        # AUR keys split packages (e.g. "gcc11-libs") by a separate PackageBase
+        # field ("gcc11") - the PKGBUILD and git repo live under the base name,
+        # not the package name, and fetching by `name` alone 404s silently.
+        base = (info.get("PackageBase") or name) if info else name
+
+        pkgbuild = fetch_pkgbuild(base) if info else None
+        if pkgbuild and not looks_like_pkgbuild(pkgbuild):
+            print(f"  ! fetched content for {name} doesn't look like a PKGBUILD "
+                  f"(error/challenge page?) - treating it as unscanned", file=sys.stderr)
+            pkgbuild = None
+        # None = never fetched/scanned (stays None all the way to score_package,
+        # which must not treat that as "scanned clean"); [] = scanned, no hits.
+        pkgbuild_flags = scan_pkgbuild(pkgbuild) if pkgbuild else (None if info else [])
+
+        install_file = sanitize(extract_scalar(pkgbuild, "install")) if pkgbuild else None
+        if install_file:
+            pkgbuild_flags = (pkgbuild_flags or [])
+            pkgbuild_flags.append({
+                "desc": f"sets install={install_file} - that file can run code as ROOT at "
+                        f"install/upgrade time; this scan does not read its contents "
+                        f"(see: auracular --explain {name})",
+                "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
+            })
+
+        tsquat = typosquat_check(name, official_names)
+
+        handoff = None
+        history_unavailable = False
+        aux_flags = []
+        aux_skipped = args.no_history
+        if info and not args.no_history:
+            print(f"  checking commit history for {name}...", file=sys.stderr)
+            commits, aux_files = fetch_commit_history(base)
+            if commits is None:
+                history_unavailable = True
+                aux_skipped = True
+            else:
+                handoff = analyze_maintainer_history(commits)
+            for fname, body in aux_files.items():
+                for f in scan_pkgbuild(body, source_label=fname):
+                    f["penalty"] = int(f["penalty"] * 1.5)  # runs as root at install time
+                    aux_flags.append(f)
+
+        score, notes = score_package(name, info, pkgbuild_flags, tsquat, handoff=handoff,
+                                      history_unavailable=history_unavailable,
+                                      aux_flags=aux_flags, verbose=args.verbose)
+        if info and args.no_history:
+            notes.append("commit history check skipped (--no-history) - maintainer-handoff "
+                          "detection AND auxiliary/.install file scanning did not run")
+        elif info and aux_skipped:
+            notes.append("auxiliary/.install file scanning did not run (commit history was unavailable)")
+        if base != name:
+            notes.insert(0, f"part of split package base '{base}' - PKGBUILD/history read from there")
+        results.append((name, score, notes))
+
+    results.sort(key=lambda r: r[1])  # riskiest first
+
+    print()
+    print(f"{'PACKAGE':<24}{'SCORE':>6}  {'RISK':<12}WHY")
+    print("-" * 90)
+    for name, score, notes in results:
+        print(f"{name:<24}{styled_score_field(score, 6)}  {styled_bucket_field(score, 12)}{headline_reason(notes)}")
+
+    print()
+    print("Details (riskiest first):")
+    for name, score, notes in results:
+        if not notes:
+            continue
+        print(f"\n{name} [{score}/100, {styled_bucket_field(score, 0)}]")
+        for n in notes:
+            print(f"  - {n}")
+
+if __name__ == "__main__":
+    main()
