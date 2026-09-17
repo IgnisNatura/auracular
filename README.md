@@ -18,7 +18,7 @@ _/    _\\___/ _| \_\_/    _\\____|\___/ _____|_/    _\_| \_\
 The AUR (Arch User Repository) has no review process. Anyone can submit a `PKGBUILD`, and packages can sit unmaintained for years before a new "maintainer" quietly takes one over. Auracular doesn't replace reading the `PKGBUILD` yourself, it gives you a fast, automated first pass so you know *where* to look closer, by checking:
 
 - **AUR metadata**: votes, popularity, package age, maintainer status, out-of-date flags
-- **PKGBUILD text**: a scan for known-risky patterns (curl/wget piped into a shell, base64-decoded blobs, `eval` on downloaded output, setuid bits, sudoers/SSH-key tampering, downloads from raw IPs or pastebin-style hosts). The text is read with a small static shell parser that understands quotes, comments, line continuations, command substitutions and heredocs, so a command can't hide behind a `#` inside a string or a line split in an odd place, and a real comment that only mentions `curl | sh` isn't flagged.
+- **PKGBUILD text**: a scan for known-risky patterns (curl/wget piped into a shell, base64-decoded blobs, `eval` on downloaded output, setuid bits, sudoers/SSH-key tampering, downloads from raw IPs or pastebin-style hosts). The text is read with a small static shell parser that handles common bash syntax (quotes, comments, line continuations, command substitutions, `case` statements and heredocs, including heredocs fed to a shell), so the usual ways of hiding a command behind a `#` or an odd line split are caught. It doesn't understand all of bash, so as a backstop the most serious patterns are also checked against the plain text. A match that only shows up there (for example inside a comment) is reported as "check this by hand" and keeps the package out of LOW RISK.
 - **Install scripts and other root-run files**: the package's `install=` script is found from the `PKGBUILD` and `.SRCINFO` (whatever it's named, including split packages) and scanned with the same patterns, along with any `.install`, `.hook`, `.service` and `.timer` files in the package repo. Findings in these files weigh more, since they can run as root. If a declared install script can't be read or its name can't be worked out, that's reported and lowers the score instead of passing silently.
 - **Git commit history**: detects the "dormant package quietly taken over by a new maintainer" shape, a long gap in commits followed by a new identity picking it back up
 - **Typosquatting**: flags names that closely resemble official repo packages
@@ -37,17 +37,17 @@ auracular --no-history           # skip cloning the package repo (faster, but se
 auracular --explain pkgname      # plain-English, annotated PKGBUILD walkthrough
 ```
 
-`--explain` is worth calling out on its own: it walks through a package's `source=()`, dependencies, and every line of `verify()`/`prepare()`/`pkgver()`/`build()`/`check()`/`package()` with a best-effort plain-English annotation, plus a short primer on how to read a `PKGBUILD` yourself. If it can't find where a function ends, it says so rather than showing a shortened version. The goal is to make that habit approachable, not to replace it.
+`--explain` is worth calling out on its own: it walks through a package's `source=()`, dependencies, and the lines of `verify()`/`prepare()`/`pkgver()`/`build()`/`check()`/`package()` with a best-effort plain-English annotation, plus a short primer on how to read a `PKGBUILD` yourself. Finding where each function ends relies on the same best-effort parser: when it can tell it lost track, it says so and shows everything after the function's start, but unusual syntax could still make it cut a function short, so treat the walkthrough as a reading aid rather than a complete copy. The goal is to make that habit approachable, not to replace it.
 
 ### What each mode reads
 
 | | PKGBUILD | Install scripts and `.hook`/`.service`/`.timer` files | Commit history (handoff check) |
 |---|---|---|---|
-| Default | scanned | scanned | checked |
+| Default | scanned | scanned, for files that pass the safety checks below | checked |
 | `--no-history` | scanned | **not read** (the report says so, and a declared install script lowers the score) | skipped |
-| `--explain` | walked through and scanned | **not read**, direct links are printed instead | not checked |
+| `--explain` | walked through and scanned | **not read**; links are printed only for install scripts it can resolve from the PKGBUILD | not checked |
 
-The default mode clones each package's AUR git repo to get the install scripts and history, so it's the only mode that reads everything.
+The default mode clones each package's AUR git repo to get the install scripts and history, so it's the only mode that attempts all three checks. For safety it won't read a file from the clone that is a symlink, points outside the repo, isn't a regular file, or is over 1MB. A declared install script skipped for one of those reasons is reported as unread; other skipped files (a `.service` symlink, say) currently aren't called out individually.
 
 ### Requirements
 
