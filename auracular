@@ -307,22 +307,45 @@ def scan_pkgbuild(text, source_label="PKGBUILD"):
 
 MAX_AUX_FILE_BYTES = 1_000_000
 
+MISSING = "no such file in the package repo"
+
 def read_contained_file(root, path):
-    """Contents of `path` if it is a regular, non-symlink file of sane size
-    fully inside `root`, else None. A malicious package's repo could commit
-    a symlink (e.g. "pwn.install" -> "/home/you/.ssh/id_rsa") or a
-    "../"-style path to trick this scanner into reading and displaying an
-    arbitrary local file."""
+    """(contents, None) if `path` is a regular, non-symlink file of sane size
+    fully inside `root`, else (None, reason). reason is MISSING when nothing
+    exists there, otherwise why an existing path was refused. A malicious
+    package's repo could commit a symlink (e.g. "pwn.install" ->
+    "/home/you/.ssh/id_rsa") or a "../"-style path to trick this scanner
+    into reading and displaying an arbitrary local file."""
     try:
         if path.is_symlink():
-            return None
+            return None, "refused: it is a symlink"
         resolved = path.resolve()
-        resolved.relative_to(root)
-        if not resolved.is_file() or resolved.stat().st_size > MAX_AUX_FILE_BYTES:
-            return None
-        return resolved.read_text(errors="replace")
-    except (OSError, ValueError):
-        return None
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None, "refused: it points outside the package repo"
+        if not resolved.exists():
+            return None, MISSING
+        if not resolved.is_file():
+            return None, "refused: not a regular file"
+        if resolved.stat().st_size > MAX_AUX_FILE_BYTES:
+            return None, "refused: larger than the 1MB read limit"
+        return resolved.read_text(errors="replace"), None
+    except OSError as e:
+        return None, f"refused: read error ({e.strerror or e.__class__.__name__})"
+
+class AuxFiles(dict):
+    """{relative_path: contents} of files read from a package clone, plus
+    `skipped`: {relative_path: reason} for every requested or discovered
+    path that was not read, so "absent from this dict" is never ambiguous."""
+
+    def __init__(self):
+        super().__init__()
+        self.skipped = {}
+
+    def status(self, path):
+        """None if `path` was read, else the reason it wasn't."""
+        return None if path in self else self.skipped.get(path, MISSING)
 
 def parse_git_log(output):
     """Parse NUL-separated `%ae%x00%an%x00%at` records. Returns (commits,
@@ -352,13 +375,14 @@ def fetch_commit_history(name, extra_files=(), timeout=15):
     first, or None if the history couldn't be read completely - callers
     should treat None as "history unavailable", not "clean".
 
-    aux_files is {relative_path: contents} for any .install/.hook/.service/
-    .timer files, plus any `extra_files` (relative paths, e.g. an install
-    script named by `install=` without a .install suffix), plus the
-    .SRCINFO file under the key SRCINFO along with any install scripts it
-    declares. .SRCINFO is metadata, not code: callers should pop it before
-    scanning. aux_files is None if the clone itself failed or errored
-    before any file could be read, meaning no auxiliary file was read.
+    aux_files is an AuxFiles {relative_path: contents} for any .install/
+    .hook/.service/.timer files, plus any `extra_files` (relative paths,
+    e.g. an install script named by `install=` without a .install suffix),
+    plus the .SRCINFO file under the key SRCINFO along with any install
+    scripts it declares; its `skipped` records why every other requested
+    or discovered path wasn't read. .SRCINFO is metadata, not code: callers
+    should pop it before scanning. aux_files is None if the clone itself
+    failed or errored before any file could be read.
 
     AUR packages are tiny repos (PKGBUILD + maybe an .install file), so a
     full clone is cheap."""
@@ -382,21 +406,25 @@ def fetch_commit_history(name, extra_files=(), timeout=15):
             if complete:
                 commits = parsed
 
-        aux_files = {}
-        srcinfo = read_contained_file(root, root / SRCINFO)
+        aux_files = AuxFiles()
+        srcinfo, _ = read_contained_file(root, root / SRCINFO)
         if srcinfo is not None:
             aux_files[SRCINFO] = srcinfo
             extra_files = [*extra_files, *srcinfo_install_targets(srcinfo)]
 
-        candidates = [p for pattern in AUX_GLOBS for p in root.rglob(pattern)]
-        candidates += [root / rel for rel in extra_files]
-        for p in candidates:
-            key = str(p.relative_to(root)) if p.is_relative_to(root) else None
-            if key is None or key in aux_files:
+        candidates = [(str(p.relative_to(root)), p) for pattern in AUX_GLOBS for p in root.rglob(pattern)]
+        candidates += [(rel, root / rel) for rel in extra_files]
+        for key, p in candidates:
+            if key in aux_files or key in aux_files.skipped:
                 continue
-            body = read_contained_file(root, p)
+            if not p.is_relative_to(root):
+                aux_files.skipped[key] = "refused: it points outside the package repo"
+                continue
+            body, reason = read_contained_file(root, p)
             if body is not None:
                 aux_files[key] = body
+            else:
+                aux_files.skipped[key] = reason
         return commits, aux_files
     except Exception:
         return None, None
@@ -504,7 +532,7 @@ def typosquat_check(name, official_names):
     return None
 
 def score_package(name, info, pkgbuild_flags, typosquat_target, handoff=None,
-                   history_unavailable=False, aux_flags=None, verbose=False):
+                   history_unavailable=False, aux_flags=None, coverage_flags=None, verbose=False):
     """pkgbuild_flags is None when the PKGBUILD could not be fetched/scanned
     at all (distinct from an empty list, which means it WAS scanned and
     nothing matched) - callers must pass None rather than [] in that case,
@@ -514,7 +542,8 @@ def score_package(name, info, pkgbuild_flags, typosquat_target, handoff=None,
     turn a None (PKGBUILD unscanned) into a non-None list the moment any
     aux finding exists, silently erasing the "PKGBUILD was never read"
     warning even though the PKGBUILD itself - the primary thing this tool
-    is supposed to check - still wasn't."""
+    is supposed to check - still wasn't. coverage_flags (e.g. an install
+    script that couldn't be read) is separate for the same reason."""
     score = 70  # neutral baseline
     notes = []
 
@@ -534,7 +563,7 @@ def score_package(name, info, pkgbuild_flags, typosquat_target, handoff=None,
         notes.append("orphaned: no maintainer")
 
     unscanned = pkgbuild_flags is None
-    all_flags = (pkgbuild_flags or []) + (aux_flags or [])
+    all_flags = (pkgbuild_flags or []) + (aux_flags or []) + (coverage_flags or [])
 
     if votes < 5 and pop < 0.5:
         score -= 15
@@ -808,13 +837,17 @@ def variable_lookup(pkgbuild, name, base):
         if len(hits) != 1:
             return None if hits else []
         v = re.escape(var)
-        m = re.match(rf"^\s*{v}=\(", hits[0])
-        if m:
-            arr = re.search(rf"^\s*{v}=\(([^)#]*)\)", pkgbuild, re.MULTILINE)
-            if not arr:
+        if re.match(rf"^\s*{v}=\(", hits[0]):
+            # Array elements undergo brace expansion and may be indexed
+            # ([0]=x), so only pkgname's documented plain-name subset is
+            # accepted, and only when the whole declaration parses.
+            if var != "pkgname":
                 return None
-            words = re.findall(rf"{SHELL_WORD[:-1]}+", arr.group(1))
-            values = [expand_word(w, no_vars) for w in words]
+            arr = re.search(rf"^\s*{v}=\(([^)#]*)\)[ \t]*$", pkgbuild, re.MULTILINE)
+            word = SHELL_WORD[:-1] + "+"
+            if not arr or not re.fullmatch(rf"\s*(?:{word}\s+)*(?:{word})?\s*", arr.group(1)):
+                return None
+            values = [expand_word(w, no_vars) for w in re.findall(word, arr.group(1))]
             if any(val is None or len(val) != 1 for val in values):
                 return None
             values = [val[0] for val in values]
@@ -1036,6 +1069,49 @@ after build). $pkgdir = the staging root for what actually gets installed
 - treat any line touching $pkgdir as the one to read most carefully.
 """
 
+def install_coverage_flags(name, declarations, unaccounted, srcinfo_targets, aux_files):
+    """Findings for every install script that wasn't confirmed read. An
+    install script runs as ROOT at install/upgrade time, so an unread one
+    must never pass silently.
+
+    A declaration with several possible values is covered when at least one
+    was read and none was refused: a candidate that simply doesn't exist is
+    a hypothetical alternative (makepkg can't package a missing file), but
+    one that exists and was refused (symlink, too large, ...) may be the
+    real script. aux_files is None when no file could be read at all."""
+    status = aux_files.status if aux_files is not None else (lambda path: "the package repo wasn't read")
+    unread = {}
+    for raw, cands in declarations:
+        if cands is None:
+            unread.setdefault(raw, "its value can't be resolved statically")
+            continue
+        statuses = {c: status(c) for c in cands}
+        refused = {c: s for c, s in statuses.items() if s not in (None, MISSING)}
+        for c, s in refused.items():
+            unread.setdefault(c, s)
+        if not refused and all(s is not None for s in statuses.values()):
+            target = cands[0] if len(cands) == 1 else raw
+            reason = statuses[cands[0]] if len(cands) == 1 else MISSING
+            unread.setdefault(target, reason)
+    for target in srcinfo_targets:
+        s = status(target)
+        if s is not None:
+            unread.setdefault(target, f"{s} (declared in .SRCINFO)")
+
+    flags = [{
+        "desc": f"sets install={sanitize(target)} - that file can run code as ROOT at "
+                f"install/upgrade time, and this scan could not read it: {reason} "
+                f"(see: auracular --explain {name})",
+        "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
+    } for target, reason in unread.items()]
+    if unaccounted:
+        flags.append({
+            "desc": f"may set install= in {unaccounted} place(s) this scan can't follow - a "
+                    f"root-run install script may have gone unread (see: auracular --explain {name})",
+            "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
+        })
+    return flags
+
 def headline_reason(notes, max_len=58):
     non_baseline = [n for n in notes if not n.startswith("baseline:")]
     if not non_baseline:
@@ -1172,37 +1248,13 @@ def main():
                     aux_flags.append(f)
         aux_skipped = aux_files is None
 
-        # An install script runs as ROOT at install/upgrade time. Reading it
-        # is what matters, so warn (and penalize) whenever a declared script
-        # wasn't confirmed read. A declaration counts as read if any of its
-        # possible values was: every candidate that exists in the repo is
-        # read, and a real target missing from the repo can't be built.
-        read = aux_files or {}
-        unread = {}
-        for raw, cands in declarations:
-            if cands is None:
-                unread.setdefault(raw, "its value can't be resolved statically")
-            elif not any(c in read for c in cands):
-                unread.setdefault(cands[0] if len(cands) == 1 else raw, "this scan could not read its contents")
-        for target in srcinfo_targets:
-            if target not in read:
-                unread.setdefault(target, "this scan could not read its contents (declared in .SRCINFO)")
-        for target, reason in unread.items():
-            pkgbuild_flags.append({
-                "desc": f"sets install={sanitize(target)} - that file can run code as ROOT at "
-                        f"install/upgrade time; {reason} (see: auracular --explain {name})",
-                "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
-            })
-        if unaccounted:
-            pkgbuild_flags.append({
-                "desc": f"may set install= in {unaccounted} place(s) this scan can't follow - a "
-                        f"root-run install script may have gone unread (see: auracular --explain {name})",
-                "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
-            })
+        coverage_flags = install_coverage_flags(name, declarations, unaccounted,
+                                                srcinfo_targets, aux_files)
 
         score, notes = score_package(name, info, pkgbuild_flags, tsquat, handoff=handoff,
                                       history_unavailable=history_unavailable,
-                                      aux_flags=aux_flags, verbose=args.verbose)
+                                      aux_flags=aux_flags, coverage_flags=coverage_flags,
+                                      verbose=args.verbose)
         if info and args.no_history:
             notes.append("commit history check skipped (--no-history) - maintainer-handoff "
                           "detection AND auxiliary/.install file scanning did not run")

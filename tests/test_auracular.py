@@ -403,6 +403,19 @@ class InstallTargetTests(unittest.TestCase):
                 self.assertEqual(len(declarations), 1)
                 self.assertIsNone(declarations[0][1])
 
+    def test_helper_arrays_are_unresolved(self):
+        for assignment in ("_hook=([0]=post-install)", "_hook=({post-,}install)", "_hook=(post-install)"):
+            with self.subTest(assignment=assignment):
+                declarations, _ = self.targets(f"pkgname=demo\n{assignment}\ninstall=$_hook\n")
+                self.assertEqual(declarations, [("$_hook", None)])
+
+    def test_pkgname_array_must_be_plain_and_fully_parsed(self):
+        for assignment in ("pkgname=({demo,demo-docs})", "pkgname=([0]=demo)",
+                           "pkgname=(demo) extra", "pkgname=(demo 'a b')"):
+            with self.subTest(assignment=assignment):
+                declarations, _ = self.targets(f"{assignment}\ninstall=$pkgname.install\n")
+                self.assertEqual(declarations, [("$pkgname.install", None)])
+
     def test_unfollowable_setters_are_unaccounted(self):
         cases = [
             "pkgver=1; install=post-install\n",
@@ -428,23 +441,74 @@ class InstallTargetTests(unittest.TestCase):
         self.assertEqual(au.srcinfo_install_targets(srcinfo), ["docs.install", "post-install"])
 
 
+class InstallCoverageTests(unittest.TestCase):
+    """G2: how each declaration's candidate read statuses become warnings."""
+
+    def aux(self, read=(), skipped=None):
+        files = au.AuxFiles()
+        files.update({path: "" for path in read})
+        files.skipped.update(skipped or {})
+        return files
+
+    def targets_warned(self, declarations, aux_files, srcinfo=(), unaccounted=0):
+        flags = au.install_coverage_flags("demo", declarations, unaccounted, list(srcinfo), aux_files)
+        return [f["desc"] for f in flags]
+
+    def test_read_candidate_with_missing_alternative_is_covered(self):
+        warned = self.targets_warned([("$pkgname", ["demo", "demo-docs"])],
+                                     self.aux(read=["demo"], skipped={"demo-docs": au.MISSING}))
+        self.assertEqual(warned, [])
+
+    def test_refused_candidate_is_warned_even_when_another_was_read(self):
+        warned = self.targets_warned([("$pkgname", ["demo", "demo-docs"])],
+                                     self.aux(read=["demo"], skipped={"demo-docs": "refused: it is a symlink"}))
+        self.assertEqual(len(warned), 1)
+        self.assertIn("install=demo-docs", warned[0])
+        self.assertIn("refused: it is a symlink", warned[0])
+
+    def test_no_candidate_read_is_warned(self):
+        warned = self.targets_warned([("$pkgname", ["demo", "demo-docs"])], self.aux())
+        self.assertEqual(len(warned), 1)
+        self.assertIn("install=$pkgname", warned[0])
+
+    def test_unread_repo_warns_every_declaration(self):
+        warned = self.targets_warned([("post-install", ["post-install"])], None)
+        self.assertEqual(len(warned), 1)
+        self.assertIn("the package repo wasn't read", warned[0])
+
+    def test_unresolved_and_unaccounted_are_warned(self):
+        warned = self.targets_warned([("$_x", None)], self.aux(), unaccounted=2)
+        self.assertEqual(len(warned), 2)
+        self.assertIn("can't be resolved statically", warned[0])
+        self.assertIn("in 2 place(s)", warned[1])
+
+    def test_srcinfo_target_must_be_read(self):
+        self.assertEqual(self.targets_warned([], self.aux(read=["a"]), srcinfo=["a"]), [])
+        warned = self.targets_warned([], self.aux(), srcinfo=["a"])
+        self.assertIn("declared in .SRCINFO", warned[0])
+
+
 class InstallScanReportTests(GitRepoTestCase):
     """N2 end to end: main() must read and score a declared install script
     whatever its name, and say so when it couldn't."""
 
-    def _report(self, pkgbuild, files, argv=("demo",), base="demo"):
+    def _report(self, pkgbuild, files, argv=None, base="demo", links=(),
+                name="demo", pkgbuild_fetchable=True):
         (self.repo_dir / "PKGBUILD").write_text(pkgbuild)
-        for name, body in files.items():
-            (self.repo_dir / name).write_text(body)
+        for filename, body in files.items():
+            (self.repo_dir / filename).write_text(body)
+        for filename, target in links:
+            (self.repo_dir / filename).symlink_to(target)
         self._commit_all()
-        info = dict(ESTABLISHED_INFO, Name="demo", PackageBase=base)
+        info = dict(ESTABLISHED_INFO, Name=name, PackageBase=base)
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(au, "AUR_GIT_URL", self.repo_dir.as_uri()))
-            stack.enter_context(mock.patch.object(au, "fetch_aur_info", return_value={"demo": info}))
-            stack.enter_context(mock.patch.object(au, "fetch_pkgbuild", return_value=pkgbuild))
+            stack.enter_context(mock.patch.object(au, "fetch_aur_info", return_value={name: info}))
+            stack.enter_context(mock.patch.object(au, "fetch_pkgbuild",
+                                                  return_value=pkgbuild if pkgbuild_fetchable else None))
             stack.enter_context(mock.patch.object(au, "official_repo_names", return_value=set()))
-            stack.enter_context(mock.patch.object(sys, "argv", ["auracular", *argv]))
+            stack.enter_context(mock.patch.object(sys, "argv", ["auracular", *(argv or (name,))]))
             stack.enter_context(contextlib.redirect_stdout(out))
             stack.enter_context(quiet())
             au.main()
@@ -473,7 +537,7 @@ class InstallScanReportTests(GitRepoTestCase):
     def test_missing_install_script_is_reported_unread(self):
         report = self._report("pkgname=demo\ninstall=post-install\npackage() { :; }\n", {})
         self.assertIn("sets install=post-install", report)
-        self.assertIn("could not read its contents", report)
+        self.assertIn("could not read it", report)
 
     def test_decoy_file_does_not_satisfy_literal_target(self):
         report = self._report("pkgname=demo\ninstall='$pkgname'\npackage() { :; }\n",
@@ -513,11 +577,43 @@ class InstallScanReportTests(GitRepoTestCase):
                               {".SRCINFO": "pkgbase = demo\n\tinstall = gone\npkgname = demo\n"})
         self.assertIn("declared in .SRCINFO", report)
 
+    def test_unavailable_pkgbuild_and_refused_srcinfo_target_both_reported(self):
+        # G1: must not crash, and must keep the missing-PKGBUILD warning.
+        report = self._report("pkgname=demo\n",
+                              {".SRCINFO": "pkgbase = demo\n\tinstall = hook-link\npkgname = demo\n",
+                               "hook": "post_install() { :; }\n"},
+                              links=[("hook-link", "hook")], pkgbuild_fetchable=False)
+        self.assertIn("PKGBUILD could NOT be fetched", report)
+        self.assertIn("sets install=hook-link", report)
+        self.assertIn("refused: it is a symlink (declared in .SRCINFO)", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_readable_candidate_does_not_cover_refused_candidate(self):
+        # G2: demo-docs's real script is a refused symlink; a clean file
+        # named after the sibling package must not satisfy the declaration.
+        pkgbuild = ("pkgname=(demo demo-docs)\npackage_demo() { :; }\n"
+                    "package_demo-docs() {\n  install=$pkgname\n}\n")
+        report = self._report(pkgbuild, {"demo": "post_install() { :; }\n",
+                                         "hook": f"post_install() {{\n  {DOWNLOAD}\n}}\n"},
+                              links=[("demo-docs", "hook")], name="demo-docs")
+        self.assertIn("sets install=demo-docs", report)
+        self.assertIn("refused: it is a symlink", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_array_helper_decoy_is_not_read_as_the_target(self):
+        # G3: bash gives install the value post-install here, not the
+        # literal "[0]=post-install".
+        report = self._report("pkgname=demo\n_hook=([0]=post-install)\ninstall=$_hook\npackage() { :; }\n",
+                              {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n",
+                               "[0]=post-install": "post_install() { :; }\n"})
+        self.assertIn("its value can't be resolved statically", report)
+        self.assertNotIn("LOW RISK", report)
+
     def test_no_history_reports_install_script_unread(self):
         report = self._report("pkgname=demo\ninstall=post-install\npackage() { :; }\n",
                               {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n"},
                               argv=("--no-history", "demo"))
-        self.assertIn("could not read its contents", report)
+        self.assertIn("could not read it", report)
         self.assertIn("auxiliary/.install file scanning did not run", report)
 
 
