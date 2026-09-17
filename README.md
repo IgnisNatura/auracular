@@ -105,6 +105,10 @@ AI played a role in scripting this application, but it's been heavily modified a
 
 Either way, treat the source the same way Auracular asks you to treat a `PKGBUILD`: it's readable, it's not long, and you should look at it yourself rather than taking my word for what it does. Issues and PRs pointing out logic gaps, missed patterns, or just cleaner ways to write something are welcome. That's a big part of why I'm sharing this while it's still early instead of waiting until it feels finished.
 
+## No warranty
+
+Auracular is provided as is, with no guarantee that it will catch a malicious package or that its scores are correct. A LOW RISK result can still be wrong. You're responsible for what you choose to install, and the author isn't liable for any damage or loss from using this tool or relying on its results. See the [LICENSE](LICENSE) for the full terms.
+
 ## License
 
 [FSL-1.1-MIT](LICENSE) (Functional Source License). Free to use, modify, and redistribute for any purpose that isn't a competing commercial product or service. Each release automatically converts to plain MIT two years after it's published, see the LICENSE file for the exact terms.
