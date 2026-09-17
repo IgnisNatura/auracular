@@ -18,7 +18,8 @@ _/    _\\___/ _| \_\_/    _\\____|\___/ _____|_/    _\_| \_\
 The AUR (Arch User Repository) has no review process. Anyone can submit a `PKGBUILD`, and packages can sit unmaintained for years before a new "maintainer" quietly takes one over. Auracular doesn't replace reading the `PKGBUILD` yourself, it gives you a fast, automated first pass so you know *where* to look closer, by checking:
 
 - **AUR metadata**: votes, popularity, package age, maintainer status, out-of-date flags
-- **PKGBUILD text**: regex scan for known-risky patterns (curl/wget piped into a shell, base64-decoded blobs, `eval` on command substitution, setuid bits, sudoers/SSH-key tampering, downloads from raw IPs or pastebin-style hosts)
+- **PKGBUILD text**: a scan for known-risky patterns (curl/wget piped into a shell, base64-decoded blobs, `eval` on downloaded output, setuid bits, sudoers/SSH-key tampering, downloads from raw IPs or pastebin-style hosts). The text is read with a small static shell parser that understands quotes, comments, line continuations, command substitutions and heredocs, so a command can't hide behind a `#` inside a string or a line split in an odd place, and a real comment that only mentions `curl | sh` isn't flagged.
+- **Install scripts and other root-run files**: the package's `install=` script is found from the `PKGBUILD` and `.SRCINFO` (whatever it's named, including split packages) and scanned with the same patterns, along with any `.install`, `.hook`, `.service` and `.timer` files in the package repo. Findings in these files weigh more, since they can run as root. If a declared install script can't be read or its name can't be worked out, that's reported and lowers the score instead of passing silently.
 - **Git commit history**: detects the "dormant package quietly taken over by a new maintainer" shape, a long gap in commits followed by a new identity picking it back up
 - **Typosquatting**: flags names that closely resemble official repo packages
 
@@ -32,15 +33,25 @@ Each package gets a 0-100 score and a risk bucket (LOW RISK / REVIEW / CAUTION /
 auracular                        # no args = score every installed AUR package
 auracular pkgname [pkgname2 ...] # check specific package(s), e.g. before installing
 auracular -v                     # also show matched PKGBUILD lines
-auracular --no-history           # skip the git-clone handoff check (faster)
+auracular --no-history           # skip cloning the package repo (faster, but see below)
 auracular --explain pkgname      # plain-English, annotated PKGBUILD walkthrough
 ```
 
-`--explain` is worth calling out on its own: it walks through a package's `source=()`, dependencies, and every line of `prepare()`/`build()`/`check()`/`package()` with a best-effort plain-English annotation, plus a short primer on how to read a `PKGBUILD` yourself. The goal is to make that habit approachable, not to replace it.
+`--explain` is worth calling out on its own: it walks through a package's `source=()`, dependencies, and every line of `verify()`/`prepare()`/`pkgver()`/`build()`/`check()`/`package()` with a best-effort plain-English annotation, plus a short primer on how to read a `PKGBUILD` yourself. If it can't find where a function ends, it says so rather than showing a shortened version. The goal is to make that habit approachable, not to replace it.
+
+### What each mode reads
+
+| | PKGBUILD | Install scripts and `.hook`/`.service`/`.timer` files | Commit history (handoff check) |
+|---|---|---|---|
+| Default | scanned | scanned | checked |
+| `--no-history` | scanned | **not read** (the report says so, and a declared install script lowers the score) | skipped |
+| `--explain` | walked through and scanned | **not read**, direct links are printed instead | not checked |
+
+The default mode clones each package's AUR git repo to get the install scripts and history, so it's the only mode that reads everything.
 
 ### Requirements
 
-- Python 3
+- Python 3.9 or newer (developed and tested on 3.14)
 - `pacman` and `git` on `PATH` (Arch Linux or an Arch-based distro)
 - Network access (AUR RPC + AUR git repos)
 
@@ -54,12 +65,22 @@ cd auracular
 
 No dependencies outside the Python standard library. Symlink or copy `auracular` onto your `PATH` if you want it available globally.
 
+### Running the tests
+
+```
+python3 -m unittest discover -s tests -v
+```
+
+The tests run offline. They use small hand-written `PKGBUILD` examples, mocked AUR responses and throwaway local git repos, and never execute any package code. Many of them come straight from outside reviews of this project, kept so a later change can't quietly bring an old bug back.
+
 ## Limitations
 
 - The red-flag patterns are a fixed, hand-picked list. They catch careless and copy-pasted malware, not a determined attacker who knows this tool exists and works around it (e.g. splitting a command across variables). A `PKGBUILD` can be malicious without tripping any of them.
 - The maintainer-handoff detection is a heuristic on commit timing and identity similarity, not a positive identification of anything. Legitimate co-maintenance changes can occasionally trigger it, and never seeing a flag doesn't rule out a quieter takeover.
-- It reads the `PKGBUILD` as text and never executes it. That's deliberate, but it also means anything only visible at build/run time is outside its reach.
-- `install=` hook files (`.install` scripts, which run as root at install/upgrade time) are flagged as present when history-fetching succeeds, but their *contents* aren't scored the way the PKGBUILD's are. Read them yourself when one is flagged, `--explain` prints the direct link.
+- It reads the `PKGBUILD` as text and never executes it. That's deliberate, but it also means anything only visible at build/run time is outside its reach. The shell parser covers common bash syntax, not all of it, and code that's assembled while the script runs (like `eval` on a built-up string, which is flagged on its own) can't be followed.
+- Working out which install script a package uses is best-effort. It only fills in simple variables like `$pkgname`, and anything it can't resolve or doesn't recognize as a plain `install=` line is reported as a warning. That can occasionally warn on a harmless package, which is the intended trade-off.
+- Install scripts and `.hook`/`.service`/`.timer` findings are weighted as if they run as root, based only on the file type. That's true for install scripts but not necessarily for every service or timer file.
+- With no arguments it checks your installed AUR packages by name, but it scans each package's *current* recipe on the AUR, not the exact version you installed.
 - It complements reading the `PKGBUILD` yourself. It doesn't replace it.
 
 ### Known gaps (roadmap, not yet implemented)
@@ -68,7 +89,9 @@ No dependencies outside the Python standard library. Symlink or copy `auracular`
 - No check for a package's `provides=`/`replaces=` hijacking an official repo package name on upgrade.
 - The typosquat check only compares against official repo packages, not other popular AUR packages (so an AUR-vs-AUR squat like `yay-bim` vs `yay-bin` is invisible), and misses some short-name squats.
 - `KNOWN_HOSTS` (used by `--explain`'s source-host check) is a short allowlist and will mislabel plenty of legitimate vendor download hosts as "unrecognized." Treat that specific check as low-confidence for now.
-- `extract_array()` can mis-parse a `source=()` array that contains a nested `$(...)` command substitution.
+- `--explain`'s dependency and `source=()` listing still uses simpler parsing than the scanner and can mis-read an array that contains a nested `$(...)` command substitution.
+- A package that isn't found on the AUR (removed, renamed, or moved to the official repos) scores 0 / HIGH RISK, the same as a truly dangerous one. It should get its own "couldn't verify" result instead.
+- Exit codes don't yet tell "scan finished" apart from "something failed along the way" (for example, if `pacman` or the AUR can't be reached), so scripts calling Auracular can't rely on them.
 
 ## About this project
 
