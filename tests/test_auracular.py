@@ -333,28 +333,99 @@ INTERPRETER_RULE = "pipes a download straight into an interpreter"
 
 
 class InstallTargetTests(unittest.TestCase):
-    """N2: install scripts are found from what the PKGBUILD declares, not
-    from an optional .install suffix, including split-package overrides."""
+    """N2, F1, F2: install scripts are found from what the PKGBUILD declares
+    (not an optional .install suffix), with bash quoting respected, and any
+    install-setting line that isn't fully understood is counted as
+    unaccounted rather than silently ignored."""
+
+    def targets(self, text, name="demo", base="demo"):
+        return au.install_targets(text, name, base)
 
     def test_global_install_without_suffix(self):
-        self.assertEqual(au.install_targets("pkgname=demo\ninstall=post-install\n", "demo", "demo"),
-                         (["post-install"], []))
+        self.assertEqual(self.targets("pkgname=demo\ninstall=post-install\n"),
+                         ([("post-install", ["post-install"])], 0))
 
-    def test_split_package_function_install(self):
-        text = "pkgname=(demo demo-docs)\npackage_demo() {\n  install=post-install\n  :\n}\n"
-        self.assertEqual(au.install_targets(text, "demo", "bundle"), (["post-install"], []))
+    def test_indented_declaration_is_found(self):
+        self.assertEqual(self.targets("pkgname=demo\n  install=post-install\n"),
+                         ([("post-install", ["post-install"])], 0))
 
-    def test_other_split_package_install_not_attributed(self):
-        text = "pkgname=(demo demo-docs)\npackage_demo-docs() {\n  install=docs.install\n}\n"
-        self.assertEqual(au.install_targets(text, "demo", "bundle"), ([], []))
+    def test_split_package_declarations_all_found(self):
+        text = ("pkgname=(demo demo-docs)\npackage_demo() {\n  install=post-install\n  :\n}\n"
+                "package_demo-docs() {\n  install=docs.install\n}\n")
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("post-install", ["post-install"]), ("docs.install", ["docs.install"])], 0))
 
-    def test_pkgname_and_pkgbase_substituted(self):
-        text = "pkgname=demo\ninstall=$pkgname.install\npackage() {\n  install=${pkgbase}-extra\n}\n"
-        self.assertEqual(au.install_targets(text, "demo", "base"), (["demo.install", "base-extra"], []))
+    def test_declaration_after_escaped_or_heredoc_brace_is_found(self):
+        for body in ("  printf \\}\n", "cat <<'EOF'\n}\nEOF\n"):
+            with self.subTest(body=body):
+                text = f"pkgname=(demo)\npackage_demo() {{\n{body}  install=post-install\n}}\n"
+                self.assertEqual(self.targets(text), ([("post-install", ["post-install"])], 0))
 
-    def test_other_variables_reported_unresolved(self):
-        text = "pkgname=demo\ninstall=${_name}.install\n"
-        self.assertEqual(au.install_targets(text, "demo", "demo"), ([], ["${_name}.install"]))
+    def test_single_quoted_variable_is_literal(self):
+        self.assertEqual(self.targets("pkgname=demo\ninstall='$pkgname'\n"),
+                         ([("'$pkgname'", ["$pkgname"])], 0))
+
+    def test_escaped_dollar_is_literal(self):
+        self.assertEqual(self.targets('pkgname=demo\ninstall="\\$pkgname"\n'),
+                         ([('"\\$pkgname"', ["$pkgname"])], 0))
+
+    def test_double_quoted_variable_is_expanded(self):
+        self.assertEqual(self.targets('pkgname=demo\ninstall="$pkgname.install"\n'),
+                         ([('"$pkgname.install"', ["demo.install"])], 0))
+
+    def test_pkgbase_defaults_to_first_pkgname_plus_aur_base(self):
+        text = "pkgname=(demo demo-docs)\ninstall=${pkgbase}-extra\n"
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("${pkgbase}-extra", ["bundle-extra", "demo-extra"])], 0))
+
+    def test_split_pkgname_expands_to_every_package(self):
+        text = "pkgname=(demo demo-docs)\ninstall=$pkgname.install\n"
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("$pkgname.install", ["demo-docs.install", "demo.install"])], 0))
+
+    def test_single_literal_helper_variable_is_resolved(self):
+        text = "pkgname=demo-git\n_name=demo\ninstall=${_name}.install\n"
+        self.assertEqual(self.targets(text, name="demo-git"),
+                         ([("${_name}.install", ["demo.install"])], 0))
+
+    def test_ambiguous_or_computed_values_are_unresolved(self):
+        cases = [
+            "pkgname=demo\ninstall=${_name}.install\n",
+            "pkgname=demo\n_name=a\n_name=b\ninstall=$_name.install\n",
+            "pkgname=demo\n_name=$(date)\ninstall=$_name.install\n",
+            "pkgname=demo\ninstall=${pkgname%-git}.install\n",
+            'pkgname=demo\ninstall="$(echo post-install)"\n',
+            "pkgname=demo\nlocal pkgname=other\ninstall=$pkgname.install\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                declarations, _ = self.targets(text)
+                self.assertEqual(len(declarations), 1)
+                self.assertIsNone(declarations[0][1])
+
+    def test_unfollowable_setters_are_unaccounted(self):
+        cases = [
+            "pkgver=1; install=post-install\n",
+            "printf -v install post-install\n",
+            "declare -n ref=install\n",
+            "install+=.extra\n",
+            'install="post-\ninstall"\n',
+            "read -r install <<< post-install\n",
+            "install[0]=post-install\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertGreaterEqual(self.targets("pkgname=demo\n" + text)[1], 1)
+
+    def test_non_setting_lines_are_ignored(self):
+        text = ("pkgname=demo\n# install=old.install\n"
+                'package() {\n  install -Dm644 x "$pkgdir/x"\n  make DESTDIR="$pkgdir" install\n'
+                "  ./configure --enable-install=yes\n  install=\n  install=''\n}\n")
+        self.assertEqual(self.targets(text), ([], 0))
+
+    def test_srcinfo_install_entries(self):
+        srcinfo = "pkgbase = bundle\n\tinstall = post-install\npkgname = demo\n\tinstall = ./docs.install\n"
+        self.assertEqual(au.srcinfo_install_targets(srcinfo), ["docs.install", "post-install"])
 
 
 class InstallScanReportTests(GitRepoTestCase):
@@ -404,6 +475,44 @@ class InstallScanReportTests(GitRepoTestCase):
         self.assertIn("sets install=post-install", report)
         self.assertIn("could not read its contents", report)
 
+    def test_decoy_file_does_not_satisfy_literal_target(self):
+        report = self._report("pkgname=demo\ninstall='$pkgname'\npackage() { :; }\n",
+                              {"$pkgname": f"post_install() {{\n  {DOWNLOAD}\n}}\n",
+                               "demo": "post_install() { :; }\n"})
+        self.assertIn(f"$pkgname: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
+
+    def test_install_after_escaped_brace_is_scanned(self):
+        pkgbuild = "pkgname=(demo)\npackage_demo() {\n  printf \\}\n  install=post-install\n}\n"
+        report = self._report(pkgbuild, {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n"})
+        self.assertIn(f"post-install: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
+
+    def test_unfollowable_install_setter_is_warned_and_not_low_risk(self):
+        report = self._report("pkgname=demo\npackage() {\n  printf -v install post-install\n}\n",
+                              {"post-install": "post_install() { :; }\n"})
+        self.assertIn("may set install= in 1 place(s) this scan can't follow", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_unresolved_install_is_warned_even_if_files_were_read(self):
+        report = self._report("pkgname=demo\ninstall=${_name}.install\npackage() { :; }\n",
+                              {"demo.install": "post_install() { :; }\n"})
+        self.assertIn("its value can't be resolved statically", report)
+        self.assertNotIn("LOW RISK", report)
+
+    def test_srcinfo_declared_install_script_is_scanned(self):
+        report = self._report("pkgname=demo\npackage() { :; }\n",
+                              {".SRCINFO": ("pkgbase = demo\n\tinstall = hook-script\n"
+                                            "\tsource = http://192.0.2.1/demo.tar.gz\npkgname = demo\n"),
+                               "hook-script": f"post_install() {{\n  {DOWNLOAD}\n}}\n"})
+        self.assertIn(f"hook-script: {INTERPRETER_RULE}", report)
+        self.assertNotIn(".SRCINFO:", report)
+
+    def test_srcinfo_declared_missing_script_is_warned(self):
+        report = self._report("pkgname=demo\npackage() { :; }\n",
+                              {".SRCINFO": "pkgbase = demo\n\tinstall = gone\npkgname = demo\n"})
+        self.assertIn("declared in .SRCINFO", report)
+
     def test_no_history_reports_install_script_unread(self):
         report = self._report("pkgname=demo\ninstall=post-install\npackage() { :; }\n",
                               {"post-install": f"post_install() {{\n  {DOWNLOAD}\n}}\n"},
@@ -432,6 +541,22 @@ class GitLogParsingTests(GitRepoTestCase):
         self.assertIsNotNone(handoff)
         self.assertEqual(handoff["gap_days"], 399)
 
+    def test_log_timeout_keeps_auxiliary_files(self):
+        (self.repo_dir / "demo.install").write_text("post_install() { :; }\n")
+        self._commit_all()
+        real_run = au.subprocess.run
+
+        def log_times_out(args, **kwargs):
+            if "log" in args:
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 15))
+            return real_run(args, **kwargs)
+
+        with mock.patch.object(au.subprocess, "run", side_effect=log_times_out):
+            commits, aux_files = self._clone_and_scan()
+        self.assertIsNone(commits)
+        self.assertIsNotNone(aux_files)
+        self.assertIn("demo.install", aux_files)
+
     def test_malformed_record_marks_history_incomplete(self):
         commits, complete = au.parse_git_log("a@x\x00A\x001\nbroken record\n")
         self.assertEqual(commits, [("a@x", "A", 1)])
@@ -454,6 +579,12 @@ class RpcRowValidationTests(unittest.TestCase):
             {"Name": "demo", "NumVotes": "12"},
             {"Name": "demo", "NumVotes": True},
             {"Name": "demo", "Popularity": "high"},
+            {"Name": "demo", "NumVotes": None},
+            {"Name": "demo", "Popularity": None},
+            {"Name": "demo", "Popularity": 10**400},
+            {"Name": "demo", "Popularity": float("nan")},
+            {"Name": "demo", "Popularity": float("inf")},
+            {"Name": "demo", "NumVotes": -1},
             {"Name": "demo", "FirstSubmitted": 10**20},
             {"Name": "demo", "OutOfDate": -1},
             {"Name": "demo", "Maintainer": 5},

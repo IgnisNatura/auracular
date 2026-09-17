@@ -19,7 +19,9 @@ Usage:
 """
 import argparse
 import json
+import math
 import pathlib
+import posixpath
 import re
 import shlex
 import shutil
@@ -123,6 +125,7 @@ SUSPICIOUS_PATTERNS = [
 ]
 
 AUX_GLOBS = ("*.install", "*.hook", "*.service", "*.timer")
+SRCINFO = ".SRCINFO"
 
 def http_get(url, timeout=8):
     req = urllib.request.Request(url, headers=UA)
@@ -159,24 +162,42 @@ def fetch_aur_info(names):
 # Latest timestamp datetime.fromtimestamp() can represent (end of year 9999).
 MAX_TIMESTAMP = 253402300799
 
+MAX_RPC_NUMBER = 1e12
+
 def valid_rpc_row(row):
     """Every field scoring relies on has the type scoring expects. One bad
     row fails the whole lookup: silently dropping it would turn that
-    package into a misleading "not found on AUR"."""
+    package into a misleading "not found on AUR". A field may be absent
+    (scoring has a default), but only fields scoring treats as optional
+    may be explicitly null."""
     def is_num(v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool)
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False
+        try:
+            return math.isfinite(float(v)) and 0 <= v <= MAX_RPC_NUMBER
+        except OverflowError:
+            return False
 
     def is_ts(v):
         return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_TIMESTAMP
 
+    def is_str(v):
+        return isinstance(v, str)
+
     if not isinstance(row, dict) or not isinstance(row.get("Name"), str) or not row["Name"]:
         return False
+    # field: (check, may be null)
     checks = {
-        "NumVotes": is_num, "Popularity": is_num,
-        "FirstSubmitted": is_ts, "OutOfDate": is_ts,
-        "Maintainer": lambda v: isinstance(v, str), "PackageBase": lambda v: isinstance(v, str),
+        "NumVotes": (is_num, False), "Popularity": (is_num, False),
+        "FirstSubmitted": (is_ts, True), "OutOfDate": (is_ts, True),
+        "Maintainer": (is_str, True), "PackageBase": (is_str, True),
     }
-    return all(row.get(key) is None or check(row[key]) for key, check in checks.items())
+    for key, (check, nullable) in checks.items():
+        if key not in row or (row[key] is None and nullable):
+            continue
+        if not check(row[key]):
+            return False
+    return True
 
 def fetch_pkgbuild(name):
     try:
@@ -333,8 +354,11 @@ def fetch_commit_history(name, extra_files=(), timeout=15):
 
     aux_files is {relative_path: contents} for any .install/.hook/.service/
     .timer files, plus any `extra_files` (relative paths, e.g. an install
-    script named by `install=` without a .install suffix). It is None if
-    the clone itself failed, meaning no auxiliary file was read at all.
+    script named by `install=` without a .install suffix), plus the
+    .SRCINFO file under the key SRCINFO along with any install scripts it
+    declares. .SRCINFO is metadata, not code: callers should pop it before
+    scanning. aux_files is None if the clone itself failed or errored
+    before any file could be read, meaning no auxiliary file was read.
 
     AUR packages are tiny repos (PKGBUILD + maybe an .install file), so a
     full clone is cheap."""
@@ -348,16 +372,24 @@ def fetch_commit_history(name, extra_files=(), timeout=15):
         root = pathlib.Path(tmpdir).resolve()
 
         commits = None
-        r2 = subprocess.run(["git", "-C", tmpdir, "log", "--reverse", "--format=%ae%x00%an%x00%at"],
-                             capture_output=True, text=True, timeout=timeout)
-        if r2.returncode == 0:
+        try:
+            r2 = subprocess.run(["git", "-C", tmpdir, "log", "--reverse", "--format=%ae%x00%an%x00%at"],
+                                 capture_output=True, text=True, timeout=timeout)
+        except (subprocess.SubprocessError, OSError):
+            r2 = None
+        if r2 is not None and r2.returncode == 0:
             parsed, complete = parse_git_log(r2.stdout)
             if complete:
                 commits = parsed
 
+        aux_files = {}
+        srcinfo = read_contained_file(root, root / SRCINFO)
+        if srcinfo is not None:
+            aux_files[SRCINFO] = srcinfo
+            extra_files = [*extra_files, *srcinfo_install_targets(srcinfo)]
+
         candidates = [p for pattern in AUX_GLOBS for p in root.rglob(pattern)]
         candidates += [root / rel for rel in extra_files]
-        aux_files = {}
         for p in candidates:
             key = str(p.relative_to(root)) if p.is_relative_to(root) else None
             if key is None or key in aux_files:
@@ -678,30 +710,177 @@ def extract_function_body(text, funcname):
         i += 1
     return text[m.end():i - 1]
 
+# --- install script discovery -------------------------------------------
+# An install script runs as root, so missing one is a false "safe". Rather
+# than trust a parser to find every declaration, discovery is paired with a
+# backstop: any code line that could set `install` but isn't a declaration
+# this code fully understands is reported as unaccounted for.
+
+MAX_EXPANSIONS = 16
+
+def code_lines(text):
+    """Physical lines that aren't whole-line comments. Deliberately crude:
+    it keeps inline comments and string contents, which can only cause
+    extra warnings here, never missed ones."""
+    return [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+
+def setter_re(var):
+    """Anything that could assign `var`: plain/append/indexed assignment,
+    printf -v, and declare-style builtins naming it as an argument or as a
+    nameref target (`declare -n ref=var`)."""
+    v = re.escape(var)
+    return re.compile(
+        rf"(?<![\w-]){v}(?:\[[^\]]*\])?\s*\+?="
+        rf"|\bprintf\b[^\n;&|]*-v\s*['\"]?{v}(?![-.\w])"
+        rf"|\b(?:read|declare|typeset|local|export|readonly|mapfile|readarray|unset)\b"
+        rf"(?:\s+[^\s;&|]+?)*?(?:\s+|=)['\"]?{v}(?![-.\w])"
+    )
+
+# One shell word: unquoted characters without operators/expansions that
+# can't be followed statically, backslash escapes, or complete quotes.
+SHELL_WORD = r"""(?:[^\s;&|<>()#'"\\`]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")*"""
+INSTALL_DECL_RE = re.compile(rf"^\s*install=(?P<word>{SHELL_WORD})\s*(?:\s#.*)?$")
+PKGNAME_CHARS_RE = re.compile(r"^[A-Za-z0-9@._+-]+$")
+
+def expand_word(word, lookup):
+    """Every value `word` can statically take, applying bash quoting: no
+    expansion inside single quotes, and $var/${var} replaced by
+    lookup(var)'s candidate values elsewhere. Returns a sorted list, or None
+    if any part (command substitution, ${var%...}, unknown variables,
+    leading ~) can't be resolved with confidence."""
+    results = [""]
+    quote = None
+    i = 0
+    while i < len(word):
+        c = word[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            else:
+                results = [r + c for r in results]
+            i += 1
+        elif c == "\\":
+            if i + 1 >= len(word):
+                return None
+            nxt = word[i + 1]
+            if quote == '"' and nxt not in '$`"\\':
+                results = [r + c for r in results]
+                i += 1
+            else:
+                results = [r + nxt for r in results]
+                i += 2
+        elif c == "'" and quote is None:
+            quote = "'"
+            i += 1
+        elif c == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+        elif c == "$":
+            m = re.match(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))", word[i:])
+            values = lookup(m.group(1) or m.group(2)) if m else None
+            if not values:
+                return None
+            results = [r + v for r in results for v in values]
+            if len(results) > MAX_EXPANSIONS:
+                return None
+            i += m.end()
+        elif c == "`" or (c == "~" and i == 0 and quote is None):
+            return None
+        else:
+            results = [r + c for r in results]
+            i += 1
+    if quote:
+        return None
+    return sorted(set(results))
+
+def variable_lookup(pkgbuild, name, base):
+    """lookup(var) for expand_word: the literal value(s) of a variable
+    assigned exactly once, in a form that needs no evaluation. pkgname
+    also allows the AUR package name, and every element of a split
+    package's pkgname array (makepkg sets pkgname to each in turn).
+    pkgbase also allows the AUR package base, and defaults to the first
+    pkgname. Anything else is None (unresolved)."""
+    lines = code_lines(pkgbuild)
+    no_vars = lambda var: None
+
+    def assigned_values(var):
+        hits = [l for l in lines if setter_re(var).search(l)]
+        if len(hits) != 1:
+            return None if hits else []
+        v = re.escape(var)
+        m = re.match(rf"^\s*{v}=\(", hits[0])
+        if m:
+            arr = re.search(rf"^\s*{v}=\(([^)#]*)\)", pkgbuild, re.MULTILINE)
+            if not arr:
+                return None
+            words = re.findall(rf"{SHELL_WORD[:-1]}+", arr.group(1))
+            values = [expand_word(w, no_vars) for w in words]
+            if any(val is None or len(val) != 1 for val in values):
+                return None
+            values = [val[0] for val in values]
+        else:
+            m = re.match(rf"^\s*{v}=(?P<word>{SHELL_WORD})\s*(?:\s#.*)?$", hits[0])
+            values = expand_word(m.group("word"), no_vars) if m else None
+        if values is not None and var in ("pkgname", "pkgbase"):
+            if not all(PKGNAME_CHARS_RE.match(val) for val in values):
+                return None
+        return values
+
+    def lookup(var):
+        values = assigned_values(var)
+        if var == "pkgname":
+            if values is None:
+                return None
+            return sorted(set(values) | {name})
+        if var == "pkgbase":
+            if values == []:
+                names = assigned_values("pkgname")
+                values = names[:1] if names else None
+            if values is None:
+                return None
+            return sorted(set(values) | {base})
+        return values or None
+
+    return lookup
+
 def install_targets(pkgbuild, name, base):
-    """Static best guess at which install script(s) makepkg would package
-    for `name`: a global `install=`, plus any `install=` set inside the
-    package's own package()/package_<name>() function (split packages can
-    override it there). makepkg accepts any filename, so no suffix is
-    assumed. Only $pkgname/$pkgbase are substituted - the PKGBUILD is never
-    sourced. Returns (resolved, unresolved), both lists of strings."""
-    values = []
-    top = extract_scalar(pkgbuild, "install")
-    if top:
-        values.append(top)
-    for func in ("package", f"package_{name}"):
-        body = extract_function_body(pkgbuild, func)
-        if body:
-            for m in re.finditer(r'^\s*install=(.+?)\s*$', body, re.MULTILINE):
-                values.append(m.group(1).strip().strip('"\''))
-    resolved, unresolved = [], []
-    for v in values:
-        v = re.sub(r'\$(?:\{pkgname\}|pkgname(?!\w))', name, v)
-        v = re.sub(r'\$(?:\{pkgbase\}|pkgbase(?!\w))', base, v)
-        target = unresolved if "$" in v or "`" in v else resolved
-        if v not in target:
-            target.append(v)
-    return resolved, unresolved
+    """Install scripts the PKGBUILD may package, found statically without
+    sourcing it. makepkg accepts any filename, so no suffix is assumed.
+    Declarations anywhere in the file count, including every split
+    package's - sibling packages share this repo and maintainer, so
+    reading their scripts too is harmless extra coverage.
+
+    Returns (declarations, unaccounted): declarations is a list of
+    (raw_value, candidates) where candidates is a list of normalized
+    relative paths the value may resolve to, or None if unresolved;
+    unaccounted counts code lines that may set `install` in a form this
+    function doesn't understand (e.g. `a=1; install=x`, `printf -v
+    install`, a multi-line value)."""
+    lookup = variable_lookup(pkgbuild, name, base)
+    setter = setter_re("install")
+    declarations, unaccounted = [], 0
+    for line in code_lines(pkgbuild):
+        if not setter.search(line):
+            continue
+        m = INSTALL_DECL_RE.match(line)
+        if not m:
+            unaccounted += 1
+            continue
+        word = m.group("word")
+        values = expand_word(word, lookup)
+        if values is not None:
+            if not any(values):
+                continue  # install= / install='' - explicitly no script
+            values = sorted({posixpath.normpath(v) for v in values if v})
+        declarations.append((word, values))
+    return declarations, unaccounted
+
+def srcinfo_install_targets(srcinfo):
+    """install = <file> entries from .SRCINFO, which makepkg writes with
+    values already expanded. The maintainer produces this file too, so it
+    supplements the PKGBUILD's declarations and never replaces them."""
+    found = re.findall(r"^\s*install\s*=\s*(.*?)\s*$", srcinfo, re.MULTILINE)
+    return sorted({posixpath.normpath(v) for v in found if v})
 
 def annotate_line(line):
     for pattern, note in LINE_ANNOTATIONS:
@@ -811,15 +990,20 @@ def print_explain_report(name, info, pkgbuild, base=None):
     else:
         print("  none of this script's known-bad patterns matched")
 
-    targets, unresolved = install_targets(pkgbuild, name, base)
-    for target in targets:
-        print(f"\n  !! sets install={sanitize(target)} - that file can run code as ROOT at install/"
+    declarations, unaccounted = install_targets(pkgbuild, name, base)
+    for raw, cands in declarations:
+        if cands is None:
+            print(f"\n  !! sets install={sanitize(raw)} - a root-run install script whose name "
+                  f"can't be resolved statically; read the PKGBUILD to see which file that is")
+            continue
+        print(f"\n  !! sets install={sanitize(raw)} - that file can run code as ROOT at install/"
               f"upgrade time, which --explain does not read. Fetch and read it yourself:")
-        print(f"     https://aur.archlinux.org/cgit/aur.git/plain/"
-              f"{urllib.parse.quote(target)}?h={urllib.parse.quote(base)}")
-    for target in unresolved:
-        print(f"\n  !! sets install={sanitize(target)} - a root-run install script whose name is built "
-              f"from a variable; read the PKGBUILD to see which file that is")
+        for target in cands:
+            print(f"     https://aur.archlinux.org/cgit/aur.git/plain/"
+                  f"{urllib.parse.quote(target)}?h={urllib.parse.quote(base)}")
+    if unaccounted:
+        print(f"\n  !! {unaccounted} line(s) may set install= in a form this scan can't follow - "
+              f"search the PKGBUILD for 'install' and check each one yourself")
 
     print(PKGBUILD_PRIMER)
 
@@ -962,7 +1146,8 @@ def main():
         # which must not treat that as "scanned clean"); [] = scanned, no hits.
         pkgbuild_flags = scan_pkgbuild(pkgbuild) if pkgbuild else (None if info else [])
 
-        targets, unresolved_targets = install_targets(pkgbuild, name, base) if pkgbuild else ([], [])
+        declarations, unaccounted = install_targets(pkgbuild, name, base) if pkgbuild else ([], 0)
+        wanted = sorted({c for _, cands in declarations for c in (cands or [])})
 
         tsquat = typosquat_check(name, official_names)
 
@@ -970,13 +1155,17 @@ def main():
         history_unavailable = False
         aux_flags = []
         aux_files = None
+        srcinfo_targets = []
         if info and not args.no_history:
             print(f"  checking commit history for {name}...", file=sys.stderr)
-            commits, aux_files = fetch_commit_history(base, extra_files=targets)
+            commits, aux_files = fetch_commit_history(base, extra_files=wanted)
             if commits is None:
                 history_unavailable = True
             else:
                 handoff = analyze_maintainer_history(commits)
+            if aux_files is not None:
+                srcinfo = aux_files.pop(SRCINFO, None)
+                srcinfo_targets = srcinfo_install_targets(srcinfo) if srcinfo else []
             for fname, body in (aux_files or {}).items():
                 for f in scan_pkgbuild(body, source_label=fname):
                     f["penalty"] = int(f["penalty"] * 1.5)  # runs as root at install time
@@ -984,14 +1173,30 @@ def main():
         aux_skipped = aux_files is None
 
         # An install script runs as ROOT at install/upgrade time. Reading it
-        # is what matters; only warn (and penalize) when it wasn't read.
-        unread = [t for t in targets if t not in (aux_files or {})] + unresolved_targets
-        for target in unread:
-            reason = ("its name is built from a variable this scan can't resolve"
-                      if target in unresolved_targets else "this scan could not read its contents")
+        # is what matters, so warn (and penalize) whenever a declared script
+        # wasn't confirmed read. A declaration counts as read if any of its
+        # possible values was: every candidate that exists in the repo is
+        # read, and a real target missing from the repo can't be built.
+        read = aux_files or {}
+        unread = {}
+        for raw, cands in declarations:
+            if cands is None:
+                unread.setdefault(raw, "its value can't be resolved statically")
+            elif not any(c in read for c in cands):
+                unread.setdefault(cands[0] if len(cands) == 1 else raw, "this scan could not read its contents")
+        for target in srcinfo_targets:
+            if target not in read:
+                unread.setdefault(target, "this scan could not read its contents (declared in .SRCINFO)")
+        for target, reason in unread.items():
             pkgbuild_flags.append({
                 "desc": f"sets install={sanitize(target)} - that file can run code as ROOT at "
                         f"install/upgrade time; {reason} (see: auracular --explain {name})",
+                "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
+            })
+        if unaccounted:
+            pkgbuild_flags.append({
+                "desc": f"may set install= in {unaccounted} place(s) this scan can't follow - a "
+                        f"root-run install script may have gone unread (see: auracular --explain {name})",
                 "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
             })
 
