@@ -151,10 +151,32 @@ def fetch_aur_info(names):
         print(f"  ! AUR RPC returned an unexpected/error response: {err}", file=sys.stderr)
         return None
     results = data.get("results")
-    if not isinstance(results, list):
+    if not isinstance(results, list) or not all(valid_rpc_row(r) for r in results):
         print("  ! AUR RPC response had a malformed 'results' field", file=sys.stderr)
         return None
-    return {r["Name"]: r for r in results if isinstance(r, dict) and "Name" in r}
+    return {r["Name"]: r for r in results}
+
+# Latest timestamp datetime.fromtimestamp() can represent (end of year 9999).
+MAX_TIMESTAMP = 253402300799
+
+def valid_rpc_row(row):
+    """Every field scoring relies on has the type scoring expects. One bad
+    row fails the whole lookup: silently dropping it would turn that
+    package into a misleading "not found on AUR"."""
+    def is_num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def is_ts(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_TIMESTAMP
+
+    if not isinstance(row, dict) or not isinstance(row.get("Name"), str) or not row["Name"]:
+        return False
+    checks = {
+        "NumVotes": is_num, "Popularity": is_num,
+        "FirstSubmitted": is_ts, "OutOfDate": is_ts,
+        "Maintainer": lambda v: isinstance(v, str), "PackageBase": lambda v: isinstance(v, str),
+    }
+    return all(row.get(key) is None or check(row[key]) for key, check in checks.items())
 
 def fetch_pkgbuild(name):
     try:
@@ -262,14 +284,57 @@ def scan_pkgbuild(text, source_label="PKGBUILD"):
             })
     return flags
 
-def fetch_commit_history(name, timeout=15):
+MAX_AUX_FILE_BYTES = 1_000_000
+
+def read_contained_file(root, path):
+    """Contents of `path` if it is a regular, non-symlink file of sane size
+    fully inside `root`, else None. A malicious package's repo could commit
+    a symlink (e.g. "pwn.install" -> "/home/you/.ssh/id_rsa") or a
+    "../"-style path to trick this scanner into reading and displaying an
+    arbitrary local file."""
+    try:
+        if path.is_symlink():
+            return None
+        resolved = path.resolve()
+        resolved.relative_to(root)
+        if not resolved.is_file() or resolved.stat().st_size > MAX_AUX_FILE_BYTES:
+            return None
+        return resolved.read_text(errors="replace")
+    except (OSError, ValueError):
+        return None
+
+def parse_git_log(output):
+    """Parse NUL-separated `%ae%x00%an%x00%at` records. Returns (commits,
+    complete). Author names are chosen by whoever commits, so a delimiter
+    that can legally appear in a name (like "|") would let a committer
+    corrupt or hide their own record; NUL can't appear in either field.
+    complete is False if any record was still malformed, so callers can
+    report the history as unreliable instead of silently analyzing a
+    subset of it."""
+    commits, complete = [], True
+    for line in output.splitlines():
+        parts = line.split("\x00")
+        if len(parts) != 3:
+            complete = False
+            continue
+        email, author_name, ts = parts
+        try:
+            commits.append((email.strip().lower(), author_name.strip(), int(ts)))
+        except ValueError:
+            complete = False
+    return commits, complete
+
+def fetch_commit_history(name, extra_files=(), timeout=15):
     """Clone the package's AUR git repo and return (commits, aux_files).
+
     commits is a list of (email, author_name, unix_ts) per commit, oldest
-    first, or None on any failure - callers should treat None as "history
-    unavailable", not "clean". aux_files is {filename: contents} for any
-    .install/.hook/.service/.timer files in the repo (these can run as root
-    at install time and are worth scanning too), and is always a dict (may
-    be empty), even when commits is None.
+    first, or None if the history couldn't be read completely - callers
+    should treat None as "history unavailable", not "clean".
+
+    aux_files is {relative_path: contents} for any .install/.hook/.service/
+    .timer files, plus any `extra_files` (relative paths, e.g. an install
+    script named by `install=` without a .install suffix). It is None if
+    the clone itself failed, meaning no auxiliary file was read at all.
 
     AUR packages are tiny repos (PKGBUILD + maybe an .install file), so a
     full clone is cheap."""
@@ -279,43 +344,30 @@ def fetch_commit_history(name, timeout=15):
         r = subprocess.run(["git", "clone", "--quiet", url, tmpdir],
                             capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
-            return None, {}
-        r2 = subprocess.run(["git", "-C", tmpdir, "log", "--reverse", "--format=%ae|%an|%at"],
+            return None, None
+        root = pathlib.Path(tmpdir).resolve()
+
+        commits = None
+        r2 = subprocess.run(["git", "-C", tmpdir, "log", "--reverse", "--format=%ae%x00%an%x00%at"],
                              capture_output=True, text=True, timeout=timeout)
-        if r2.returncode != 0:
-            return None, {}
-        commits = []
-        for line in r2.stdout.splitlines():
-            parts = line.split("|", 2)
-            if len(parts) != 3:
-                continue
-            email, author_name, ts = parts
-            try:
-                commits.append((email.strip().lower(), author_name.strip(), int(ts)))
-            except ValueError:
-                continue
+        if r2.returncode == 0:
+            parsed, complete = parse_git_log(r2.stdout)
+            if complete:
+                commits = parsed
+
+        candidates = [p for pattern in AUX_GLOBS for p in root.rglob(pattern)]
+        candidates += [root / rel for rel in extra_files]
         aux_files = {}
-        tmp_root = pathlib.Path(tmpdir).resolve()
-        for pattern in AUX_GLOBS:
-            for p in pathlib.Path(tmpdir).rglob(pattern):
-                # A malicious package's repo could commit a symlink (e.g.
-                # "pwn.install" -> "/home/you/.ssh/id_rsa") to trick this
-                # scanner into reading and possibly displaying an arbitrary
-                # local file. Refuse anything that isn't a plain regular
-                # file fully contained in the clone.
-                if p.is_symlink():
-                    continue
-                try:
-                    resolved = p.resolve()
-                    resolved.relative_to(tmp_root)
-                    if not resolved.is_file() or resolved.stat().st_size > 1_000_000:
-                        continue
-                    aux_files[str(p.relative_to(tmpdir))] = resolved.read_text(errors="replace")
-                except (OSError, ValueError):
-                    continue
+        for p in candidates:
+            key = str(p.relative_to(root)) if p.is_relative_to(root) else None
+            if key is None or key in aux_files:
+                continue
+            body = read_contained_file(root, p)
+            if body is not None:
+                aux_files[key] = body
         return commits, aux_files
     except Exception:
-        return None, {}
+        return None, None
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -626,6 +678,31 @@ def extract_function_body(text, funcname):
         i += 1
     return text[m.end():i - 1]
 
+def install_targets(pkgbuild, name, base):
+    """Static best guess at which install script(s) makepkg would package
+    for `name`: a global `install=`, plus any `install=` set inside the
+    package's own package()/package_<name>() function (split packages can
+    override it there). makepkg accepts any filename, so no suffix is
+    assumed. Only $pkgname/$pkgbase are substituted - the PKGBUILD is never
+    sourced. Returns (resolved, unresolved), both lists of strings."""
+    values = []
+    top = extract_scalar(pkgbuild, "install")
+    if top:
+        values.append(top)
+    for func in ("package", f"package_{name}"):
+        body = extract_function_body(pkgbuild, func)
+        if body:
+            for m in re.finditer(r'^\s*install=(.+?)\s*$', body, re.MULTILINE):
+                values.append(m.group(1).strip().strip('"\''))
+    resolved, unresolved = [], []
+    for v in values:
+        v = re.sub(r'\$(?:\{pkgname\}|pkgname(?!\w))', name, v)
+        v = re.sub(r'\$(?:\{pkgbase\}|pkgbase(?!\w))', base, v)
+        target = unresolved if "$" in v or "`" in v else resolved
+        if v not in target:
+            target.append(v)
+    return resolved, unresolved
+
 def annotate_line(line):
     for pattern, note in LINE_ANNOTATIONS:
         if re.search(pattern, line):
@@ -641,13 +718,24 @@ def source_host(entry):
     prefix = entry[:scheme_idx] if scheme_idx != -1 else entry
     sep = prefix.rfind("::")
     url = entry[sep + 2:] if sep != -1 else entry
-    parsed = urllib.parse.urlparse(url)
-    if not parsed.netloc:
+    unresolved = "origin can't be statically resolved (built from a variable) - check how that variable is defined"
+    try:
+        parsed = urllib.parse.urlparse(url)
+        netloc = parsed.netloc
+    except ValueError:
+        # e.g. "https://[${_ipv6}]/..." - Python rejects a bracketed host
+        # that isn't a literal IPv6 address.
         if "$" in url:
-            return None, "origin can't be statically resolved (built from a variable) - check how that variable is defined"
+            return None, unresolved
+        return None, "malformed URL - read this source entry yourself"
+    if "$" in netloc:
+        return None, unresolved
+    if not netloc:
+        if "$" in url:
+            return None, unresolved
         return None, "local file bundled with the package (no download)"
-    label = "known code-hosting site" if parsed.netloc in KNOWN_HOSTS else "unrecognized host - worth a manual glance"
-    return parsed.netloc, label
+    label = "known code-hosting site" if netloc in KNOWN_HOSTS else "unrecognized host - worth a manual glance"
+    return netloc, label
 
 def print_explain_report(name, info, pkgbuild, base=None):
     base = base or name
@@ -723,11 +811,15 @@ def print_explain_report(name, info, pkgbuild, base=None):
     else:
         print("  none of this script's known-bad patterns matched")
 
-    install_file = sanitize(extract_scalar(pkgbuild, "install"))
-    if install_file:
-        print(f"\n  !! sets install={install_file} - that file can run code as ROOT at install/"
-              f"upgrade time, which this scan does not read. Fetch and read it yourself:")
-        print(f"     https://aur.archlinux.org/cgit/aur.git/plain/{install_file}?h={base}")
+    targets, unresolved = install_targets(pkgbuild, name, base)
+    for target in targets:
+        print(f"\n  !! sets install={sanitize(target)} - that file can run code as ROOT at install/"
+              f"upgrade time, which --explain does not read. Fetch and read it yourself:")
+        print(f"     https://aur.archlinux.org/cgit/aur.git/plain/"
+              f"{urllib.parse.quote(target)}?h={urllib.parse.quote(base)}")
+    for target in unresolved:
+        print(f"\n  !! sets install={sanitize(target)} - a root-run install script whose name is built "
+              f"from a variable; read the PKGBUILD to see which file that is")
 
     print(PKGBUILD_PRIMER)
 
@@ -870,34 +962,38 @@ def main():
         # which must not treat that as "scanned clean"); [] = scanned, no hits.
         pkgbuild_flags = scan_pkgbuild(pkgbuild) if pkgbuild else (None if info else [])
 
-        install_file = sanitize(extract_scalar(pkgbuild, "install")) if pkgbuild else None
-        if install_file:
-            pkgbuild_flags = (pkgbuild_flags or [])
-            pkgbuild_flags.append({
-                "desc": f"sets install={install_file} - that file can run code as ROOT at "
-                        f"install/upgrade time; this scan does not read its contents "
-                        f"(see: auracular --explain {name})",
-                "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
-            })
+        targets, unresolved_targets = install_targets(pkgbuild, name, base) if pkgbuild else ([], [])
 
         tsquat = typosquat_check(name, official_names)
 
         handoff = None
         history_unavailable = False
         aux_flags = []
-        aux_skipped = args.no_history
+        aux_files = None
         if info and not args.no_history:
             print(f"  checking commit history for {name}...", file=sys.stderr)
-            commits, aux_files = fetch_commit_history(base)
+            commits, aux_files = fetch_commit_history(base, extra_files=targets)
             if commits is None:
                 history_unavailable = True
-                aux_skipped = True
             else:
                 handoff = analyze_maintainer_history(commits)
-            for fname, body in aux_files.items():
+            for fname, body in (aux_files or {}).items():
                 for f in scan_pkgbuild(body, source_label=fname):
                     f["penalty"] = int(f["penalty"] * 1.5)  # runs as root at install time
                     aux_flags.append(f)
+        aux_skipped = aux_files is None
+
+        # An install script runs as ROOT at install/upgrade time. Reading it
+        # is what matters; only warn (and penalize) when it wasn't read.
+        unread = [t for t in targets if t not in (aux_files or {})] + unresolved_targets
+        for target in unread:
+            reason = ("its name is built from a variable this scan can't resolve"
+                      if target in unresolved_targets else "this scan could not read its contents")
+            pkgbuild_flags.append({
+                "desc": f"sets install={sanitize(target)} - that file can run code as ROOT at "
+                        f"install/upgrade time; {reason} (see: auracular --explain {name})",
+                "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": "PKGBUILD",
+            })
 
         score, notes = score_package(name, info, pkgbuild_flags, tsquat, handoff=handoff,
                                       history_unavailable=history_unavailable,
