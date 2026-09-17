@@ -18,6 +18,8 @@ Usage:
     auracular --explain pkgname      # plain-English, annotated PKGBUILD walkthrough
 """
 import argparse
+import bisect
+import functools
 import json
 import math
 import pathlib
@@ -234,54 +236,294 @@ def official_repo_names():
     except Exception:
         return set()
 
-CONTINUATION_OPERATORS = ("|", "&&", "||")
+# --- static shell lexing -------------------------------------------------
+# One pass shared by the red-flag scan, install-script discovery, and the
+# explainer's function extraction. It never executes anything: it only
+# tracks enough bash syntax (quotes, escapes, comments, line continuations,
+# command/process substitutions, heredocs) to know which text is code,
+# which is data, and where commands and { } groups begin and end.
+
+CONTINUATION_OPERATORS = ("|", "&&", "||", "|&")
+SHELL_OPERATORS = ("<<<", "<<-", ";;&", "&>>", "&&", "||", ";;", ";&", "|&", "&>", ">>",
+                   "<<", "<&", ">&", "<>", ">|", ";", "&", "|", "(", ")", "<", ">")
+SEPARATOR_OPERATORS = {"&&", "||", ";;&", ";;", ";&", "|&", ";", "&", "|", "(", ")"}
+WORD_BREAK_CHARS = set(" \t\n;&|<>()")
+# Reserved words after which the next word is still a command.
+COMMAND_PREFIX_WORDS = {"{", "!", "if", "then", "else", "elif", "do", "while", "until", "time"}
+ASSIGNMENT_WORD_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=")
+
+class ShellLex:
+    """Result of lex_shell(): statements are (line_no, text) for each
+    logical command line with comments removed and continuations joined;
+    heredoc_lines are (line_no, text) for each here-document body line
+    (data that may still be expanded or fed to a shell); words are
+    (start, end, raw, command_position) for top-level words; complete is
+    False if the text ended inside a quote, substitution, or heredoc."""
+
+    def __init__(self, text):
+        self.text = text
+        self.pos = 0
+        self.statements = []
+        self.heredoc_lines = []
+        self.words = []
+        self.complete = True
+        self._pending_heredocs = []
+        self._line_starts = [0] + [m.end() for m in re.finditer("\n", text)]
+
+    def line_no(self, offset):
+        return bisect.bisect_right(self._line_starts, offset)
+
+    def _at(self, s, offset=0):
+        return self.text.startswith(s, self.pos + offset)
+
+    def _operator(self):
+        for op in SHELL_OPERATORS:
+            if self._at(op):
+                self.pos += len(op)
+                return op
+        return None
+
+    def _single_quote(self):
+        end = self.text.find("'", self.pos + 1)
+        if end == -1:
+            self.complete = False
+            end = len(self.text) - 1
+        raw = self.text[self.pos:end + 1]
+        self.pos = end + 1
+        return raw
+
+    def _ansi_c_quote(self):
+        start = self.pos
+        self.pos += 2
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "\\":
+                self.pos += 2
+                continue
+            self.pos += 1
+            if c == "'":
+                return self.text[start:self.pos]
+        self.complete = False
+        return self.text[start:]
+
+    def _backtick(self):
+        start = self.pos
+        self.pos += 1
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "\\":
+                self.pos += 2
+                continue
+            self.pos += 1
+            if c == "`":
+                return self.text[start:self.pos]
+        self.complete = False
+        return self.text[start:]
+
+    def _braced_parameter(self):
+        start = self.pos
+        self.pos += 2
+        depth = 1
+        while self.pos < len(self.text) and depth:
+            c = self.text[self.pos]
+            if c == "\\":
+                self.pos += 2
+            elif c == "'":
+                self._single_quote()
+            elif c == '"':
+                self._double_quote()
+            elif self._at("${"):
+                depth += 1
+                self.pos += 2
+            elif self._at("$("):
+                self.pos += 2
+                self._code(nested=True)
+            else:
+                depth -= c == "}"
+                self.pos += 1
+        if depth:
+            self.complete = False
+        return self.text[start:self.pos]
+
+    def _double_quote(self):
+        out = ['"']
+        self.pos += 1
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == '"':
+                self.pos += 1
+                out.append('"')
+                return "".join(out)
+            if c == "\\":
+                if not self._at("\n", 1):
+                    out.append(self.text[self.pos:self.pos + 2])
+                self.pos += 2
+            elif self._at("$("):
+                self.pos += 2
+                out.append("$(" + self._code(nested=True) + ")")
+            elif self._at("${"):
+                out.append(self._braced_parameter())
+            elif c == "`":
+                out.append(self._backtick())
+            else:
+                out.append(c)
+                self.pos += 1
+        self.complete = False
+        return "".join(out)
+
+    def _word(self):
+        out = []
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "(" and out and out[-1].endswith("="):
+                # array assignment: name=( ... )
+                self.pos += 1
+                out.append("(" + self._code(nested=True) + ")")
+            elif c in WORD_BREAK_CHARS:
+                break
+            elif c == "\\":
+                if not self._at("\n", 1):
+                    out.append(self.text[self.pos:self.pos + 2])
+                self.pos += 2
+            elif c == "'":
+                out.append(self._single_quote())
+            elif c == '"':
+                out.append(self._double_quote())
+            elif c == "`":
+                out.append(self._backtick())
+            elif self._at("$("):
+                self.pos += 2
+                out.append("$(" + self._code(nested=True) + ")")
+            elif self._at("${"):
+                out.append(self._braced_parameter())
+            elif self._at("$'"):
+                out.append(self._ansi_c_quote())
+            else:
+                out.append(c)
+                self.pos += 1
+        return "".join(out)
+
+    def _heredoc_operator(self, op):
+        start = self.pos
+        while self._at(" ") or self._at("\t"):
+            self.pos += 1
+        raw = self._word()
+        delimiter = re.sub(r"""['"\\]""", "", raw)
+        if not delimiter:
+            self.complete = False
+        self._pending_heredocs.append((delimiter, op == "<<-"))
+        return self.text[start:self.pos]
+
+    def _heredoc_bodies(self):
+        pending, self._pending_heredocs = self._pending_heredocs, []
+        for delimiter, strip_tabs in pending:
+            while True:
+                if self.pos >= len(self.text):
+                    self.complete = False
+                    break
+                line_start = self.pos
+                nl = self.text.find("\n", self.pos)
+                end = len(self.text) if nl == -1 else nl
+                line = self.text[line_start:end]
+                self.pos = end + 1
+                if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                    break
+                self.heredoc_lines.append((self.line_no(line_start), line))
+
+    def _emit(self, start, buf):
+        text = "".join(buf)
+        if text.strip():
+            self.statements.append((self.line_no(start), text))
+
+    def _code(self, nested=False):
+        """Lex code to the end of the text, or (nested) up to and including
+        the `)` that closes a substitution or array, returning the
+        processed text in between."""
+        buf, start = [], None
+        command_position, redirect_target, function_name_next = True, False, False
+        depth = 0
+        while self.pos < len(self.text):
+            c = self.text[self.pos]
+            if c == "\n":
+                self.pos += 1
+                self._heredoc_bodies()
+                if nested:
+                    buf.append("\n")
+                    command_position = True
+                elif "".join(buf).rstrip().endswith(CONTINUATION_OPERATORS):
+                    buf.append(" ")
+                else:
+                    self._emit(start, buf)
+                    buf, start, command_position = [], None, True
+                continue
+            if c in " \t":
+                buf.append(c)
+                self.pos += 1
+                continue
+            if c == "\\" and self._at("\n", 1):
+                self.pos += 2
+                continue
+            if c == "#":
+                nl = self.text.find("\n", self.pos)
+                self.pos = len(self.text) if nl == -1 else nl
+                continue
+            if start is None:
+                start = self.pos
+            op = self._operator()
+            if op:
+                if nested and op == "(":
+                    depth += 1
+                elif nested and op == ")":
+                    if depth == 0:
+                        return "".join(buf)
+                    depth -= 1
+                buf.append(op)
+                if op in ("<<", "<<-"):
+                    buf.append(self._heredoc_operator(op))
+                elif op in ("<", ">") and self._at("("):
+                    self.pos += 1
+                    buf.append("(" + self._code(nested=True) + ")")
+                elif op in SEPARATOR_OPERATORS:
+                    command_position = True
+                else:
+                    redirect_target = True
+                continue
+            word_start = self.pos
+            raw = self._word()
+            buf.append(raw)
+            if not nested:
+                self.words.append((word_start, self.pos, raw, command_position and not redirect_target))
+            if redirect_target:
+                redirect_target = False
+            elif function_name_next:
+                function_name_next = False
+                command_position = True
+            elif command_position:
+                if raw == "function":
+                    function_name_next = True
+                    command_position = False
+                elif raw not in COMMAND_PREFIX_WORDS and not ASSIGNMENT_WORD_RE.match(raw):
+                    command_position = False
+        if nested:
+            self.complete = False
+            return "".join(buf)
+        self._emit(start, buf)
+        return None
+
+@functools.lru_cache(maxsize=64)
+def lex_shell(text):
+    lex = ShellLex(text)
+    lex._code()
+    return lex
 
 def logical_lines(text):
-    """(first_physical_line_no, joined_line) pairs. Two shapes of line
-    continuation are joined so a single logical command isn't dodged by
-    splitting it across physical lines: an explicit trailing backslash, and
-    an unescaped trailing pipe/and/or operator (bash itself keeps reading
-    in both cases).
-
-    A COMMENT line's trailing backslash is deliberately NOT treated as a
-    continuation: in real bash, a comment always ends at the physical
-    newline regardless of what it ends with, so a backslash-terminated
-    comment must not be allowed to swallow the real code on the next line.
-
-    A backslash continuation is spliced exactly like bash does it - the
-    backslash and newline are simply removed, with no space inserted - so a
-    word deliberately split mid-token ("cu\\" + "rl ...") still reassembles
-    into the real token instead of being hidden behind an accidental space.
-
-    A pending pipe/and/or continuation also survives an intervening comment
-    or blank line, matching real bash: the parser is still waiting for the
-    next token of the same pipeline, and a comment or blank line contributes
-    nothing to that wait - it doesn't end it."""
-    out, buf, start = [], "", None
-    pending = False
-    for i, raw in enumerate(text.splitlines(), 1):
-        stripped = raw.rstrip()
-        is_comment = stripped.lstrip().startswith("#")
-        is_blank = not stripped.strip()
-        if pending and (is_comment or is_blank):
-            continue
-        if start is None:
-            start = i
-        if not is_comment and stripped.endswith("\\"):
-            buf += stripped[:-1]
-            pending = True
-            continue
-        if not is_comment and stripped.endswith(CONTINUATION_OPERATORS):
-            buf += raw + " "
-            pending = True
-            continue
-        buf += raw
-        out.append((start, re.sub(r"[ \t]+", " ", buf)))
-        buf, start = "", None
-        pending = False
-    if buf:
-        out.append((start, re.sub(r"[ \t]+", " ", buf)))
-    return out
+    """(line_no, text) for every logical command line (comments removed,
+    backslash and |/&&/|| continuations joined, quoted text kept since it
+    is often passed to eval or sh -c) and every heredoc body line, in
+    source order. A line that merely starts with # inside a quoted string
+    or heredoc is not a comment and is kept."""
+    lex = lex_shell(text)
+    return sorted(lex.statements + lex.heredoc_lines, key=lambda item: item[0])
 
 def scan_pkgbuild(text, source_label="PKGBUILD"):
     """Charges each matching pattern once (with a count of how many lines it
@@ -290,19 +532,26 @@ def scan_pkgbuild(text, source_label="PKGBUILD"):
     flags = []
     if not text:
         return flags
-    # Comment-only lines don't execute - scanning them just produces false
-    # positives from example commands ("# or use: curl ... | sh") in
-    # otherwise-clean PKGBUILDs.
-    lines = [(n, l) for n, l in logical_lines(text) if not l.strip().startswith("#")]
+    lines = [(n, re.sub(r"[ \t]+", " ", l)) for n, l in logical_lines(text)]
     for pattern, desc, penalty in SUSPICIOUS_PATTERNS:
-        hits = [(n, l) for n, l in lines if re.search(pattern, l, re.IGNORECASE)]
+        hits = []
+        for n, l in lines:
+            m = re.search(pattern, l, re.IGNORECASE)
+            if m:
+                hits.append((n + l.count("\n", 0, m.start()), l))
         if hits:
             line_no, line = hits[0]
             flags.append({
                 "desc": desc, "penalty": penalty, "line_no": line_no,
-                "line": sanitize(line.strip()), "count": len(hits),
+                "line": sanitize(" ".join(line.split())), "count": len(hits),
                 "source": sanitize(source_label),
             })
+    if not lex_shell(text).complete:
+        flags.append({
+            "desc": "couldn't be fully parsed (unterminated quote, substitution, or heredoc) - "
+                    "findings for it may be incomplete",
+            "penalty": 10, "line_no": 0, "line": "", "count": 1, "source": sanitize(source_label),
+        })
     return flags
 
 MAX_AUX_FILE_BYTES = 1_000_000
@@ -703,55 +952,64 @@ def extract_array(text, varname):
     except ValueError:
         return m.group(1).split()
 
-def extract_function_body(text, funcname):
-    """Brace-depth walk that tracks quotes (and comments), so a literal '}'
-    inside a string - e.g. `printf "}"` - doesn't prematurely end the
-    function and silently truncate the rest of it from --explain's output.
-    ^-anchored (see extract_scalar) so a commented-out "# package() { ... }"
-    placeholder before the real definition can't be matched instead of it."""
-    m = re.search(rf'^{re.escape(funcname)}\s*\(\)\s*\{{', text, re.MULTILINE)
-    if not m:
-        return None
-    depth, i = 1, m.end()
-    in_squote = in_dquote = False
-    while i < len(text) and depth > 0:
-        c = text[i]
-        if in_squote:
-            if c == "'":
-                in_squote = False
-        elif in_dquote:
-            if c == '\\':
-                i += 1
-            elif c == '"':
-                in_dquote = False
-        elif c == "'":
-            in_squote = True
-        elif c == '"':
-            in_dquote = True
-        elif c == '#':
-            nl = text.find('\n', i)
-            i = nl if nl != -1 else len(text)
+FUNCTION_PARENS_RE = re.compile(r"[ \t]*\([ \t]*\)\s*")
+
+def extract_function(text, funcname):
+    """(body, complete) for `funcname() { ... }` or `function funcname
+    { ... }`, found with the shared lexer so braces inside quotes, escapes
+    (printf \\}), comments, heredocs, and substitutions don't count, and
+    only { / } words in command position open or close a group. A
+    commented-out or quoted definition can't be matched. body is None if
+    there is no such function; complete is False if its end couldn't be
+    found, in which case body runs to the end of the text."""
+    lex = lex_shell(text)
+    words = lex.words
+    for i, (start, end, raw, command_position) in enumerate(words):
+        if raw != funcname or i + 1 >= len(words):
             continue
-        elif c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-        i += 1
-    return text[m.end():i - 1]
+        after_keyword = i > 0 and words[i - 1][2] == "function" and words[i - 1][3]
+        if not (command_position or after_keyword):
+            continue
+        open_start, open_end, open_raw, open_cmd = words[i + 1]
+        if open_raw != "{" or not open_cmd:
+            continue
+        between = text[end:open_start]
+        if not (FUNCTION_PARENS_RE.fullmatch(between) or (after_keyword and not between.strip())):
+            continue
+        depth = 0
+        for w_start, _, w_raw, w_cmd in words[i + 1:]:
+            if not w_cmd:
+                continue
+            if w_raw == "{":
+                depth += 1
+            elif w_raw == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[open_end:w_start], lex.complete
+        return text[open_end:], False
+    return None, True
+
+def extract_function_body(text, funcname):
+    return extract_function(text, funcname)[0]
 
 # --- install script discovery -------------------------------------------
 # An install script runs as root, so missing one is a false "safe". Rather
-# than trust a parser to find every declaration, discovery is paired with a
-# backstop: any code line that could set `install` but isn't a declaration
-# this code fully understands is reported as unaccounted for.
+# than trust the resolver to find every declaration, discovery is paired
+# with a backstop: any lexed statement or heredoc line that could set
+# `install` but isn't a declaration this code fully understands is reported
+# as unaccounted for. The backstop is best-effort, not a guarantee: it sees
+# what the lexer sees, and text built at runtime (eval of constructed
+# strings, sourcing other files) is out of its reach - eval is flagged by
+# the red-flag scan instead.
 
 MAX_EXPANSIONS = 16
 
-def code_lines(text):
-    """Physical lines that aren't whole-line comments. Deliberately crude:
-    it keeps inline comments and string contents, which can only cause
-    extra warnings here, never missed ones."""
-    return [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+def setter_texts(pkgbuild):
+    """(is_code, text) for every lexed statement (comments removed,
+    continuations joined) and every heredoc body line."""
+    lex = lex_shell(pkgbuild)
+    return ([(True, t) for _, t in lex.statements] +
+            [(False, t) for _, t in lex.heredoc_lines])
 
 def setter_re(var):
     """Anything that could assign `var`: plain/append/indexed assignment,
@@ -768,7 +1026,7 @@ def setter_re(var):
 # One shell word: unquoted characters without operators/expansions that
 # can't be followed statically, backslash escapes, or complete quotes.
 SHELL_WORD = r"""(?:[^\s;&|<>()#'"\\`]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")*"""
-INSTALL_DECL_RE = re.compile(rf"^\s*install=(?P<word>{SHELL_WORD})\s*(?:\s#.*)?$")
+INSTALL_DECL_RE = re.compile(rf"\s*install=(?P<word>{SHELL_WORD})\s*")
 PKGNAME_CHARS_RE = re.compile(r"^[A-Za-z0-9@._+-]+$")
 
 def expand_word(word, lookup):
@@ -829,21 +1087,24 @@ def variable_lookup(pkgbuild, name, base):
     package's pkgname array (makepkg sets pkgname to each in turn).
     pkgbase also allows the AUR package base, and defaults to the first
     pkgname. Anything else is None (unresolved)."""
-    lines = code_lines(pkgbuild)
+    texts = setter_texts(pkgbuild)
     no_vars = lambda var: None
 
     def assigned_values(var):
-        hits = [l for l in lines if setter_re(var).search(l)]
+        hits = [(is_code, t) for is_code, t in texts if setter_re(var).search(t)]
         if len(hits) != 1:
             return None if hits else []
+        is_code, hit = hits[0]
+        if not is_code:
+            return None
         v = re.escape(var)
-        if re.match(rf"^\s*{v}=\(", hits[0]):
+        if re.match(rf"\s*{v}=\(", hit):
             # Array elements undergo brace expansion and may be indexed
             # ([0]=x), so only pkgname's documented plain-name subset is
             # accepted, and only when the whole declaration parses.
             if var != "pkgname":
                 return None
-            arr = re.search(rf"^\s*{v}=\(([^)#]*)\)[ \t]*$", pkgbuild, re.MULTILINE)
+            arr = re.fullmatch(rf"\s*{v}=\(([^()]*)\)\s*", hit)
             word = SHELL_WORD[:-1] + "+"
             if not arr or not re.fullmatch(rf"\s*(?:{word}\s+)*(?:{word})?\s*", arr.group(1)):
                 return None
@@ -852,8 +1113,8 @@ def variable_lookup(pkgbuild, name, base):
                 return None
             values = [val[0] for val in values]
         else:
-            m = re.match(rf"^\s*{v}=(?P<word>{SHELL_WORD})\s*(?:\s#.*)?$", hits[0])
-            values = expand_word(m.group("word"), no_vars) if m else None
+            m = re.fullmatch(rf"\s*{v}=(?P<word>{SHELL_WORD})\s*", hit)
+            values = expand_word(m.group("word"), no_vars) if m and "\n" not in hit else None
         if values is not None and var in ("pkgname", "pkgbase"):
             if not all(PKGNAME_CHARS_RE.match(val) for val in values):
                 return None
@@ -888,14 +1149,14 @@ def install_targets(pkgbuild, name, base):
     relative paths the value may resolve to, or None if unresolved;
     unaccounted counts code lines that may set `install` in a form this
     function doesn't understand (e.g. `a=1; install=x`, `printf -v
-    install`, a multi-line value)."""
+    install`, a multi-line value, a heredoc line)."""
     lookup = variable_lookup(pkgbuild, name, base)
     setter = setter_re("install")
     declarations, unaccounted = [], 0
-    for line in code_lines(pkgbuild):
-        if not setter.search(line):
+    for is_code, text in setter_texts(pkgbuild):
+        if not setter.search(text):
             continue
-        m = INSTALL_DECL_RE.match(line)
+        m = INSTALL_DECL_RE.fullmatch(text) if is_code and "\n" not in text else None
         if not m:
             unaccounted += 1
             continue
@@ -985,20 +1246,24 @@ def print_explain_report(name, info, pkgbuild, base=None):
 
     print("\n=== what the build actually does ===")
     any_function = False
-    for func in ("prepare", "build", "check", "package"):
-        body = extract_function_body(pkgbuild, func)
+    # The order makepkg runs them in.
+    for func in ("verify", "prepare", "pkgver", "build", "check", "package"):
+        body, complete = extract_function(pkgbuild, func)
         # Split packages (pkgname=(a b ...)) define package_<name>() per
         # subpackage instead of one shared package() - fall back to that so
         # --explain on a split package doesn't wrongly report "no package()".
         if body is None and func == "package":
             split_func = f"package_{name}"
-            body = extract_function_body(pkgbuild, split_func)
+            body, complete = extract_function(pkgbuild, split_func)
             if body is not None:
                 func = split_func
         if body is None:
             continue
         any_function = True
         print(f"\n  {func}() {{")
+        if not complete:
+            print("    !! couldn't find where this function ends - everything after its start is shown,")
+            print("       and the walkthrough may be wrong. Read this part of the PKGBUILD directly.")
         for raw_line in body.splitlines():
             line = sanitize(raw_line.strip())
             if not line or line.startswith("#"):
@@ -1012,7 +1277,8 @@ def print_explain_report(name, info, pkgbuild, base=None):
                 print(f"        ^ (not a pattern this script recognizes - worth reading yourself)")
         print("  }")
     if not any_function:
-        print("  no prepare()/build()/check()/package() functions found - unusual for a normal PKGBUILD")
+        print("  no verify()/prepare()/pkgver()/build()/check()/package() functions found - "
+              "unusual for a normal PKGBUILD")
 
     flags = scan_pkgbuild(pkgbuild)
     print("\n=== automated red-flag scan ===")

