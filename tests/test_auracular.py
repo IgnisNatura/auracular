@@ -592,7 +592,10 @@ class InstallTargetTests(unittest.TestCase):
 
     def test_one_level_of_nesting_and_literal_trimming(self):
         cases = {
-            "pkgname=${_n}_arch\n_n=discord\ninstall=\"$pkgname.install\"\n":
+            # _n must be set first: bash expands the right-hand side when
+            # the assignment runs, so the reverse order really does give
+            # pkgname=_arch. See the order/scope tests below.
+            "_n=discord\npkgname=${_n}_arch\ninstall=\"$pkgname.install\"\n":
                 ("discord_arch", ["discord_arch.install"]),
             "pkgname=ventoy-bin\ninstall=\"${pkgname%-bin}.install\"\n": ("ventoy-bin", ["ventoy.install"]),
             "pkgname=python-demo\ninstall=${pkgname##python-}.install\n": ("python-demo", ["demo.install"]),
@@ -614,6 +617,64 @@ class InstallTargetTests(unittest.TestCase):
         for text in cases:
             with self.subTest(text=text):
                 self.assertEqual(self.targets(text), ([("$pkgname.install", None)], 0))
+
+    # --- B6: an assignment only counts where it is established to apply ---
+    # The resolver used to credit an assignment that never runs, or runs too
+    # late, and so read a clean decoy script while the real install script
+    # went unscanned. The order and uncalled-function cases below match real
+    # bash; where the answer depends on whether some other function ran, the
+    # expectation is deliberate caution instead, since unresolved prints a
+    # coverage warning and keeps the package out of LOW RISK.
+
+    def test_later_assignment_does_not_feed_an_earlier_nested_reference(self):
+        # bash: _prefix is unset here, so _hook becomes "post-install".
+        # Crediting the later decoy- would send the scanner to the wrong file.
+        text = ("pkgname=demo\n_hook=${_prefix}post-install\n"
+                "_prefix=decoy-\ninstall=$_hook\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_forward_reference_to_a_later_assignment_is_unresolved(self):
+        text = "pkgname=demo\ninstall=${_prefix}post-install\n_prefix=decoy-\n"
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_assignment_inside_an_uncalled_function_is_unresolved(self):
+        # Line order alone would accept this one, which is why scope is
+        # checked separately: unused() never runs, so _prefix is never set.
+        text = ("pkgname=demo\nunused() {\n  _prefix=decoy-\n}\n"
+                "install=${_prefix}post-install\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_declaration_sharing_a_line_with_a_function_is_not_resolved(self):
+        # Sharing a physical line with the braces makes this one lexed
+        # statement, which is not a declaration install_targets understands,
+        # so the unaccounted backstop reports it rather than the resolver
+        # quietly picking up the decoy below. (The resolver's own containment
+        # rules are deliberately cautious about such lines too; with the
+        # current lexer nothing parseable can reach them.)
+        text = "pkgname=demo\npackage() { :; }; install=${_prefix}hook\n_prefix=decoy-\n"
+        self.assertEqual(self.targets(text), ([], 1))
+
+    def test_top_level_assignment_reaches_a_reference_inside_a_function(self):
+        # The counterpart the fix must not break: a split package sets
+        # install= in its package function, and sourcing the PKGBUILD has
+        # already run every top-level assignment by the time it is called,
+        # wherever in the file that assignment sits.
+        text = ("pkgname=demo\npackage_demo() {\n  install=$_hook\n}\n"
+                "_hook=real.install\n")
+        self.assertEqual(self.targets(text), ([("$_hook", ["real.install"])], 0))
+
+    def test_assignment_earlier_in_the_same_function_resolves(self):
+        text = ("pkgname=demo\npackage_demo() {\n  _hook=real.install\n"
+                "  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", ["real.install"])], 0))
+
+    def test_assignment_in_a_sibling_function_is_unresolved(self):
+        # makepkg does call build() before package(), so this one is
+        # conservative rather than a bash result: which siblings ran, and in
+        # what order, is not established by reading the file.
+        text = ("pkgname=demo\nbuild() {\n  _hook=decoy.install\n}\n"
+                "package_demo() {\n  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
 
     def test_only_plain_text_trim_patterns_resolve(self):
         for word in ("${pkgname%%*}.x", "${pkgname%-*}.x", "${pkgname/-bin/}.x", "${pkgname^^}.x"):

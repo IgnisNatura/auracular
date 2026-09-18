@@ -1133,18 +1133,18 @@ def extract_array(text, varname):
 
 FUNCTION_PARENS_RE = re.compile(r"[ \t]*\([ \t]*\)\s*")
 
-def extract_function(text, funcname):
-    """(body, complete) for `funcname() { ... }` or `function funcname
-    { ... }`, found with the shared lexer so braces inside quotes, escapes
-    (printf \\}), comments, heredocs, and substitutions don't count, and
-    only { / } words in command position open or close a group. A
-    commented-out or quoted definition can't be matched. body is None if
-    there is no such function; complete is False if its end couldn't be
-    found, in which case body runs to the end of the text."""
+def function_definitions(text):
+    """(name, body_start, body_end, complete) for every `name() { ... }` or
+    `function name { ... }`, found with the shared lexer so braces inside
+    quotes, escapes (printf \\}), comments, heredocs, and substitutions
+    don't count, and only { / } words in command position open or close a
+    group. A commented-out or quoted definition can't be matched. A body
+    whose end can't be found runs to the end of the text, with complete
+    False. Yielded in the order the definitions appear."""
     lex = lex_shell(text)
     words = lex.words
-    for i, (start, end, raw, command_position) in enumerate(words):
-        if raw != funcname or i + 1 >= len(words):
+    for i, (_, end, raw, command_position) in enumerate(words):
+        if raw in ("{", "}") or i + 1 >= len(words):
             continue
         after_keyword = i > 0 and words[i - 1][2] == "function" and words[i - 1][3]
         if not (command_position or after_keyword):
@@ -1155,7 +1155,7 @@ def extract_function(text, funcname):
         between = text[end:open_start]
         if not (FUNCTION_PARENS_RE.fullmatch(between) or (after_keyword and not between.strip())):
             continue
-        depth = 0
+        depth, body_end = 0, None
         for w_start, _, w_raw, w_cmd in words[i + 1:]:
             if not w_cmd:
                 continue
@@ -1164,12 +1164,33 @@ def extract_function(text, funcname):
             elif w_raw == "}":
                 depth -= 1
                 if depth == 0:
-                    return text[open_end:w_start], lex.complete
-        return text[open_end:], False
+                    body_end = w_start
+                    break
+        if body_end is None:
+            yield raw, open_end, len(text), False
+        else:
+            yield raw, open_end, body_end, lex.complete
+
+def extract_function(text, funcname):
+    """(body, complete) for one function by name. body is None if there is
+    no such function; complete is False if its end couldn't be found, in
+    which case body runs to the end of the text."""
+    for name, body_start, body_end, complete in function_definitions(text):
+        if name == funcname:
+            return text[body_start:body_end], complete
     return None, True
 
 def extract_function_body(text, funcname):
     return extract_function(text, funcname)[0]
+
+def function_body_spans(text):
+    """(first_line, last_line) for every function body. Used to tell an
+    assignment that has certainly run - a top-level one, which makepkg
+    executes when it sources the PKGBUILD - from one that only happens if
+    something calls the function holding it."""
+    lex = lex_shell(text)
+    return [(lex.line_no(start), lex.line_no(end))
+            for _, start, end, _ in function_definitions(text)]
 
 # --- install script discovery -------------------------------------------
 # An install script runs as root, so missing one is a false "safe". Rather
@@ -1274,25 +1295,64 @@ def expand_word(word, lookup):
     return sorted(set(results))
 
 def variable_lookup(pkgbuild, name, base):
-    """lookup(var) for expand_word: the literal value(s) of a variable
-    assigned exactly once, in a form that needs no evaluation. pkgname
-    also allows the AUR package name, and every element of a split
+    """lookup_at(line) -> a lookup(var) for expand_word, giving the literal
+    value(s) a variable holds where a reference on that line reads it: one
+    assignment that applies there, in a form that needs no evaluation.
+    pkgname also allows the AUR package name, and every element of a split
     package's pkgname array (makepkg sets pkgname to each in turn).
     pkgbase also allows the AUR package base, and defaults to the first
     pkgname. Anything else is None (unresolved)."""
     texts = setter_texts(pkgbuild)
+    spans = function_body_spans(pkgbuild)
     no_vars = lambda var: None
 
-    def assigned_values(var, nested=False):
-        """Literal value(s) of `var`. A scalar may refer to other variables
-        that are themselves plain literals (one level, e.g.
-        pkgname=${_pkgname}-git); those never get the AUR-name
+    def innermost(line_no, strict):
+        """The smallest function body holding `line_no`, or None for top
+        level. References use strict containment and assignments inclusive,
+        so a one-line `f() { ... }; install=$x` sharing a line with either
+        is read the cautious way round: the reference looks no further than
+        top level, and an assignment on that line is not mistaken for one."""
+        best = None
+        for lo, hi in spans:
+            inside = lo < line_no < hi if strict else lo <= line_no <= hi
+            if inside and (best is None or hi - lo < best[1] - best[0]):
+                best = (lo, hi)
+        return best
+
+    def applies(assign_line, ref_line):
+        """Whether an assignment on `assign_line` is established to have run
+        by the time a reference on `ref_line` is expanded."""
+        assign_func = innermost(assign_line, strict=False)
+        ref_func = innermost(ref_line, strict=True)
+        if assign_func is None:
+            # Sourcing the PKGBUILD runs every top-level assignment before
+            # any function body, so position only matters between two
+            # top-level lines.
+            return ref_func is not None or assign_line < ref_line
+        # Otherwise the assignment needs its own function to be the one
+        # running, and to come first within it.
+        return assign_func == ref_func and assign_line < ref_line
+
+    def assigned_values(var, ref_line, nested=False):
+        """Literal value(s) of `var` as read from `ref_line`. A scalar may
+        refer to other variables that are themselves plain literals (one
+        level, e.g. pkgname=${_pkgname}-git); those never get the AUR-name
         augmentation, so an unresolvable pkgname can't be papered over
-        with the name the AUR reports."""
-        hits = [(is_code, t) for is_code, _, t in texts if setter_re(var).search(t)]
-        if len(hits) != 1:
+        with the name the AUR reports.
+
+        Only assignments established to apply at that reference count.
+        Bash expands an assignment's right-hand side when it runs, so a
+        `_prefix=decoy-` written below `_hook=${_prefix}post-install`
+        leaves _hook alone, and one parked in a function nobody calls never
+        runs at all. Crediting either picks a filename the build never
+        installs, which is how a harmless decoy script gets read while the
+        real one goes unscanned. Anything else stays unresolved, which the
+        caller reports as missing coverage rather than silently accepting."""
+        hits = [(is_code, n, t) for is_code, n, t in texts if setter_re(var).search(t)]
+        in_scope = [h for h in hits if applies(h[1], ref_line)]
+        if len(in_scope) != 1:
             return None if hits else []
-        is_code, hit = hits[0]
+        is_code, hit_line, hit = in_scope[0]
         if not is_code:
             return None
         v = re.escape(var)
@@ -1312,29 +1372,33 @@ def variable_lookup(pkgbuild, name, base):
             values = [val[0] for val in values]
         else:
             m = re.fullmatch(rf"\s*{v}=(?P<word>{SHELL_WORD})\s*", hit)
-            inner = no_vars if nested else (lambda other: None if other == var else assigned_values(other, True))
+            # A nested value is read where THIS assignment sits, not where
+            # the outer reference does.
+            inner = no_vars if nested else (lambda other: None if other == var else assigned_values(other, hit_line, True))
             values = expand_word(m.group("word"), inner) if m and "\n" not in hit else None
         if values is not None and var in ("pkgname", "pkgbase"):
             if not all(PKGNAME_CHARS_RE.match(val) for val in values):
                 return None
         return values
 
-    def lookup(var):
-        values = assigned_values(var)
-        if var == "pkgname":
-            if values is None:
-                return None
-            return sorted(set(values) | {name})
-        if var == "pkgbase":
-            if values == []:
-                names = assigned_values("pkgname")
-                values = names[:1] if names else None
-            if values is None:
-                return None
-            return sorted(set(values) | {base})
-        return values or None
+    def lookup_at(ref_line):
+        def lookup(var):
+            values = assigned_values(var, ref_line)
+            if var == "pkgname":
+                if values is None:
+                    return None
+                return sorted(set(values) | {name})
+            if var == "pkgbase":
+                if values == []:
+                    names = assigned_values("pkgname", ref_line)
+                    values = names[:1] if names else None
+                if values is None:
+                    return None
+                return sorted(set(values) | {base})
+            return values or None
+        return lookup
 
-    return lookup
+    return lookup_at
 
 def install_targets(pkgbuild, name, base):
     """Install scripts the PKGBUILD may package, found statically without
@@ -1349,7 +1413,7 @@ def install_targets(pkgbuild, name, base):
     unaccounted counts code lines that may set `install` in a form this
     function doesn't understand (e.g. `a=1; install=x`, `printf -v
     install`, a multi-line value, a heredoc line)."""
-    lookup = variable_lookup(pkgbuild, name, base)
+    lookup_at = variable_lookup(pkgbuild, name, base)
     setter = setter_re("install")
     declarations, unaccounted_lines = [], set()
     for is_code, line_no, text in setter_texts(pkgbuild):
@@ -1360,7 +1424,7 @@ def install_targets(pkgbuild, name, base):
             unaccounted_lines.add(line_no)
             continue
         word = m.group("word")
-        values = expand_word(word, lookup)
+        values = expand_word(word, lookup_at(line_no))
         if values is not None:
             if not any(values):
                 continue  # install= / install='' - explicitly no script
