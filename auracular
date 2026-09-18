@@ -1183,15 +1183,6 @@ def extract_function(text, funcname):
 def extract_function_body(text, funcname):
     return extract_function(text, funcname)[0]
 
-def function_body_spans(text):
-    """(first_line, last_line) for every function body. Used to tell an
-    assignment that has certainly run - a top-level one, which makepkg
-    executes when it sources the PKGBUILD - from one that only happens if
-    something calls the function holding it."""
-    lex = lex_shell(text)
-    return [(lex.line_no(start), lex.line_no(end))
-            for _, start, end, _ in function_definitions(text)]
-
 # --- install script discovery -------------------------------------------
 # An install script runs as root, so missing one is a false "safe". Rather
 # than trust the resolver to find every declaration, discovery is paired
@@ -1203,6 +1194,24 @@ def function_body_spans(text):
 # the red-flag scan instead.
 
 MAX_EXPANSIONS = 16
+
+def prelude_assignment_lines(pkgbuild):
+    """Line numbers of the PKGBUILD's leading run of plain assignments, which
+    ends at the first statement that is anything else.
+
+    This is the only place an assignment is established to run, exactly once,
+    before everything after it. Nothing in that run can branch, loop, open a
+    subshell, define a function or call one, so reaching a line inside it is
+    unconditional, and every function invocation in the file necessarily
+    happens after all of it. Real PKGBUILDs put their metadata here, which is
+    what makes such a narrow rule usable: pkgname, pkgver, source, and
+    install= itself are all header lines."""
+    lines = set()
+    for line_no, text in lex_shell(pkgbuild).statements:
+        if not SIMPLE_ASSIGNMENT_RE.fullmatch(text):
+            break
+        lines.add(line_no)
+    return lines
 
 def setter_texts(pkgbuild):
     """(is_code, line_no, text) for every lexed statement (comments
@@ -1229,6 +1238,14 @@ def setter_re(var):
 SHELL_WORD = r"""(?:\$\{[^{}\s'"`]*\}|[^\s;&|<>()#'"\\`]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")*"""
 INSTALL_DECL_RE = re.compile(rf"\s*install=(?P<word>{SHELL_WORD})\s*")
 PKGNAME_CHARS_RE = re.compile(r"^[A-Za-z0-9@._+-]+$")
+
+# One plain assignment and nothing else: `x=word` or `x=(a b c)`, possibly
+# spanning lines inside the parentheses or a quote. Deliberately refuses
+# anything with a second command on it, a redirection, or an expansion this
+# code can't follow, so `a=1; b=2`, `if false; then`, `(`, and `f() {` are
+# all rejected.
+SIMPLE_ASSIGNMENT_RE = re.compile(
+    rf"\s*[A-Za-z_]\w*\+?=(?:\([^()]*\)|{SHELL_WORD})\s*", re.DOTALL)
 
 # $var, ${var}, or ${var%suffix} / ${var#prefix} (and %% / ##) with a
 # plain-text pattern, where shortest and longest match are the same.
@@ -1303,35 +1320,8 @@ def variable_lookup(pkgbuild, name, base):
     pkgbase also allows the AUR package base, and defaults to the first
     pkgname. Anything else is None (unresolved)."""
     texts = setter_texts(pkgbuild)
-    spans = function_body_spans(pkgbuild)
+    prelude = prelude_assignment_lines(pkgbuild)
     no_vars = lambda var: None
-
-    def innermost(line_no, strict):
-        """The smallest function body holding `line_no`, or None for top
-        level. References use strict containment and assignments inclusive,
-        so a one-line `f() { ... }; install=$x` sharing a line with either
-        is read the cautious way round: the reference looks no further than
-        top level, and an assignment on that line is not mistaken for one."""
-        best = None
-        for lo, hi in spans:
-            inside = lo < line_no < hi if strict else lo <= line_no <= hi
-            if inside and (best is None or hi - lo < best[1] - best[0]):
-                best = (lo, hi)
-        return best
-
-    def applies(assign_line, ref_line):
-        """Whether an assignment on `assign_line` is established to have run
-        by the time a reference on `ref_line` is expanded."""
-        assign_func = innermost(assign_line, strict=False)
-        ref_func = innermost(ref_line, strict=True)
-        if assign_func is None:
-            # Sourcing the PKGBUILD runs every top-level assignment before
-            # any function body, so position only matters between two
-            # top-level lines.
-            return ref_func is not None or assign_line < ref_line
-        # Otherwise the assignment needs its own function to be the one
-        # running, and to come first within it.
-        return assign_func == ref_func and assign_line < ref_line
 
     def assigned_values(var, ref_line, nested=False):
         """Literal value(s) of `var` as read from `ref_line`. A scalar may
@@ -1340,20 +1330,33 @@ def variable_lookup(pkgbuild, name, base):
         augmentation, so an unresolvable pkgname can't be papered over
         with the name the AUR reports.
 
-        Only assignments established to apply at that reference count.
-        Bash expands an assignment's right-hand side when it runs, so a
-        `_prefix=decoy-` written below `_hook=${_prefix}post-install`
-        leaves _hook alone, and one parked in a function nobody calls never
-        runs at all. Crediting either picks a filename the build never
-        installs, which is how a harmless decoy script gets read while the
-        real one goes unscanned. Anything else stays unresolved, which the
-        caller reports as missing coverage rather than silently accepting."""
+        Deliberately narrow: the variable must be written in exactly one
+        place in the whole file, that place must be a header assignment (see
+        prelude_assignment_lines), and it must come before the reference.
+        Everything else stays unresolved, and the caller reports that as
+        missing coverage.
+
+        The narrowness is the point. Bash expands an assignment's
+        right-hand side when it runs, and reading a PKGBUILD does not
+        establish that a given assignment ran: it may sit in a branch not
+        taken, in a subshell whose values never reach the parent, in a
+        function nobody calls, or in a function called at a moment this code
+        cannot pin down. A second writer anywhere means the value is not
+        settled even if this one is unconditional. Crediting any of those
+        picks a filename the build never installs, which is how a harmless
+        decoy script gets read while the real one goes unscanned."""
         hits = [(is_code, n, t) for is_code, n, t in texts if setter_re(var).search(t)]
-        in_scope = [h for h in hits if applies(h[1], ref_line)]
-        if len(in_scope) != 1:
+        # Any other possible writer leaves the value unsettled. Not being able
+        # to prove an assignment applies is not a proof that it is irrelevant.
+        if len(hits) != 1:
             return None if hits else []
-        is_code, hit_line, hit = in_scope[0]
-        if not is_code:
+        is_code, hit_line, hit = hits[0]
+        if not is_code or hit_line not in prelude:
+            return None
+        # The reference may sit in the header too, where order still decides.
+        # A reference anywhere else is already past the whole header, so this
+        # one check covers both, including install= inside a package function.
+        if hit_line >= ref_line:
             return None
         v = re.escape(var)
         if re.match(rf"\s*{v}=\(", hit):

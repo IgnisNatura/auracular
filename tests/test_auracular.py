@@ -654,19 +654,55 @@ class InstallTargetTests(unittest.TestCase):
         text = "pkgname=demo\npackage() { :; }; install=${_prefix}hook\n_prefix=decoy-\n"
         self.assertEqual(self.targets(text), ([], 1))
 
-    def test_top_level_assignment_reaches_a_reference_inside_a_function(self):
+    def test_header_assignment_reaches_a_reference_inside_a_function(self):
         # The counterpart the fix must not break: a split package sets
-        # install= in its package function, and sourcing the PKGBUILD has
-        # already run every top-level assignment by the time it is called,
-        # wherever in the file that assignment sits.
-        text = ("pkgname=demo\npackage_demo() {\n  install=$_hook\n}\n"
-                "_hook=real.install\n")
-        self.assertEqual(self.targets(text), ([("$_hook", ["real.install"])], 0))
-
-    def test_assignment_earlier_in_the_same_function_resolves(self):
-        text = ("pkgname=demo\npackage_demo() {\n  _hook=real.install\n"
+        # install= in its package function using a header variable. Nothing
+        # in the header can call a function, so the header has finished
+        # before any invocation.
+        text = ("pkgname=demo\n_hook=real.install\npackage_demo() {\n"
                 "  install=$_hook\n}\n")
         self.assertEqual(self.targets(text), ([("$_hook", ["real.install"])], 0))
+
+    def test_assignment_after_the_function_definition_is_unresolved(self):
+        # Reading the file does not establish when package_demo() runs. It
+        # could be called while the PKGBUILD is still being sourced, before
+        # this line, so the value is not settled.
+        text = ("pkgname=demo\npackage_demo() {\n  install=$_hook\n}\n"
+                "_hook=real.install\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_assignment_inside_a_function_is_unresolved(self):
+        # Even in the same body, before the reference: only header
+        # assignments are credited, because a function body can be entered
+        # conditionally, repeatedly, or not at all.
+        text = ("pkgname=demo\npackage_demo() {\n  _hook=real.install\n"
+                "  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
+
+    def test_setter_in_an_untaken_branch_is_unresolved(self):
+        text = ("pkgname=demo\nif false; then\n  _prefix=decoy-\nfi\n"
+                "install=${_prefix}post-install\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_setter_in_a_subshell_is_unresolved(self):
+        # A subshell's assignments never reach the parent shell at all.
+        text = ("pkgname=demo\n(\n  _prefix=decoy-\n)\n"
+                "install=${_prefix}post-install\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_function_called_while_sourcing_does_not_see_a_later_setter(self):
+        text = ("pkgname=demo\nchoose() {\n  install=${_prefix}post-install\n}\n"
+                "choose\n_prefix=decoy-\n")
+        self.assertEqual(self.targets(text), ([("${_prefix}post-install", None)], 0))
+
+    def test_a_second_possible_writer_anywhere_leaves_the_value_unsettled(self):
+        # B6a: the header assignment is unconditional, but a helper may
+        # overwrite it before install= is read. Being unable to prove the
+        # helper's assignment applies is not proof that it is irrelevant.
+        text = ("pkgname=demo\n_hook=decoy-post-install\nchoose() {\n"
+                "  _hook=post-install\n}\npackage() {\n  choose\n"
+                "  install=$_hook\n}\n")
+        self.assertEqual(self.targets(text), ([("$_hook", None)], 0))
 
     def test_assignment_in_a_sibling_function_is_unresolved(self):
         # makepkg does call build() before package(), so this one is
